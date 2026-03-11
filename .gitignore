@@ -1,3 +1,15 @@
+# environments
+venv/
+plankton_env/
+
+# datasets
+data/picture/
+data/video/
+
+# python cache
+__pycache__/
+*.pyc
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
