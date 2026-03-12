@@ -4,6 +4,7 @@ plankton_env/
 
 # datasets
 data/picture/
+data/picture_gray/
 data/video/
 
 # python cache
