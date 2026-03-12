@@ -111,12 +111,14 @@ class SimpleTracker:
 
             self.tracks[self.next_id] = {
                 "age": 0,  # 累计出现帧数
+                "start_bbox": det, # 记录第一次出现的位置
                 "bbox": det,
                 "missing": 0,
                 "best_roi": roi.copy(),
                 "best_sharpness": sharpness,
             }
             self.next_id += 1
+           
 
         # --- 步骤3：未匹配的轨迹 → missing+1，超限则结束 ---
         finished = []
@@ -125,17 +127,31 @@ class SimpleTracker:
             if tid not in matched_track_ids:
                 self.tracks[tid]["missing"] += 1
                 if self.tracks[tid]["missing"] > self.max_missing:
-                    if self.tracks[tid]["age"] >= 5:   # ← 出现不足5帧的丢弃
-                        finished.append(self.tracks[tid])
+                    track = self.tracks[tid]
+ 
+                    # 位移过滤：总位移不足10px认为是静止杂质
+                    dx = track["bbox"][0] - track["start_bbox"][0]
+                    dy = track["bbox"][1] - track["start_bbox"][1]
+                    displacement = (dx**2 + dy**2) ** 0.5
+ 
+                    if track["age"] >= 5 and displacement >= 10:
+                        finished.append(track)
                     ids_to_remove.append(tid)
+ 
         for tid in ids_to_remove:
             del self.tracks[tid]
-
+ 
         return finished
 
     def flush(self):
         """视频结束时，把所有未结束的轨迹也输出"""
-        remaining = [t for t in self.tracks.values() if t["age"] >= 5]
+        remaining = []
+        for t in self.tracks.values():
+            dx = t["bbox"][0] - t["start_bbox"][0]
+            dy = t["bbox"][1] - t["start_bbox"][1]
+            displacement = (dx**2 + dy**2) ** 0.5
+            if t["age"] >= 5 and displacement >= 10:
+                remaining.append(t)
         self.tracks.clear()
         return remaining
 
@@ -176,6 +192,7 @@ def extract_roi():
             break
 
         frame_id += 1
+        frame_h, frame_w = frame.shape[:2]
 
         # 1. MOG2背景减除
         fg_mask = subtract_background(back_sub, frame)
@@ -203,11 +220,11 @@ def extract_roi():
         if frame_id <= 35:
             cv2.imwrite(str(debug_dir / f"frame_{frame_id}.png"), frame)
             cv2.imwrite(str(debug_dir / f"fg_mask_{frame_id}.png"), fg_mask)
-            cv2.imwrite(str(debug_dir / f"thresh_{frame_id}.png"), thresh)
+            cv2.imwrite(str(debug_dir / f"thresh_{frame_id}.png"), combined)
 
         # 5. 找轮廓
         contours, _ = cv2.findContours(
-            thresh,
+            combined,
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE
         )
@@ -217,6 +234,13 @@ def extract_roi():
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < 700 or area > 20000:
+                continue
+                
+            perimeter = cv2.arcLength(cnt, True)
+            if perimeter == 0:
+                continue
+            compactness = perimeter / area
+            if compactness > 0.8:
                 continue
 
             x, y, w, h = cv2.boundingRect(cnt)
