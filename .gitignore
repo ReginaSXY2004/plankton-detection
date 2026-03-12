@@ -5,6 +5,11 @@ plankton_env/
 # datasets
 data/picture/
 data/picture_gray/
+<<<<<<< Updated upstream
+=======
+data/picture_merged/
+data/picture_best/
+>>>>>>> Stashed changes
 data/video/
 
 # python cache
