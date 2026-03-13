@@ -6,7 +6,7 @@ from preprocessing.background_subtraction import (
     create_background_subtractor,
     subtract_background,
 )
-
+from inference.roi_predictor import ROIPredictor
 
 REFERENCE_MAGNIFICATION = 1.0
 REFERENCE_FRAME_SIZE = (2448, 2048)  # width, height for the known 1.0x video
@@ -264,9 +264,9 @@ def should_reject_edge_contour(cnt, frame_w, frame_h, area, w, h, params: Scaled
 # -----------------------------------------------
 def extract_roi(magnification=1.0):
     base_dir = Path(__file__).resolve().parent.parent.parent
-    video_path = base_dir / "data" / "video" / "sample.avi"
-    output_dir = base_dir / "data" / "picture_best"
-    debug_dir = base_dir / "data" / "debug_best"
+    video_path = base_dir / "data" / "video" / "sample2.avi"
+    output_dir = base_dir / "data" / "picture_best2"
+    debug_dir = base_dir / "data" / "debug_best2"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +310,7 @@ def extract_roi(magnification=1.0):
         min_track_age=params.min_track_age,
         min_displacement=params.min_displacement,
     )
+    predictor = ROIPredictor()
 
     frame_id = 0
     roi_id = 0
@@ -375,20 +376,25 @@ def extract_roi(magnification=1.0):
 
         finished_tracks = tracker.update(detections, frame)
         for track in finished_tracks:
+            roi_img = track["best_roi"]
+
             save_path = output_dir / f"roi_{roi_id:05d}.png"
-            cv2.imwrite(str(save_path), track["best_roi"])
+            cv2.imwrite(str(save_path), roi_img)
             roi_id += 1
+
 
         print(f"frame {frame_id} | detections: {len(detections)} | saved ROI: {roi_id}")
 
     for track in tracker.flush():
+        roi_img = track["best_roi"]
+
         save_path = output_dir / f"roi_{roi_id:05d}.png"
-        cv2.imwrite(str(save_path), track["best_roi"])
+        cv2.imwrite(str(save_path), roi_img)
         roi_id += 1
 
-    cap.release()
-    print("Finished!")
-    print("Total ROI saved:", roi_id)
+        cap.release()
+        print("Finished!")
+        print("Total ROI saved:", roi_id)
 
 
 if __name__ == "__main__":
