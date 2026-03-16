@@ -15,7 +15,7 @@ REFERENCE_FRAME_SIZE = (2448, 2048)  # width, height for the known 1.0x video
 @dataclass
 class ROIParams:
     warmup_frames: int = 30
-    debug_save_until_frame: int = 100
+    debug_save_until_frame: int = 35
     gray_threshold: int = 35
 
     # contour filters (defined at 1.0x reference scale)
@@ -37,15 +37,18 @@ class ROIParams:
 
     # tracker
     tracker_iou_threshold: float = 0.3
-    tracker_max_missing: int = 8
-    roi_pad_ref: int = 30
-    min_track_age: int = 2
-    min_displacement_ref: float = 5
+    tracker_max_missing: int = 45 #物体短暂离开视野/被遮挡时，等待更多帧再放弃这条 track，而不是马上新建一条
+    roi_pad_ref: int = 18
+    min_track_age: int = 2 # 新建的 track 必须连续存活这么多帧才算有效
+    min_displacement_ref: float = 10
 
     # morphology kernels (defined at 1.0x reference scale)
-    fill_kernel_ref: int = 25
+    fill_kernel_ref: int = 15
     small_kernel_ref: int = 4
     merge_kernel_ref: int = 11
+
+    # CNN switch
+    enable_cnn: bool = True  # 设为 False 可跳过 CNN 推理，只保存 ROI 图像
 
 
 MAGNIFICATION_PROFILES = {
@@ -75,6 +78,7 @@ class ScaledParams:
         self.tracker_max_missing = base.tracker_max_missing
         self.min_track_age = base.min_track_age
         self.allow_small_edge_objects = base.allow_small_edge_objects
+        self.enable_cnn = base.enable_cnn  # 透传 CNN 开关
 
         self.min_area = max(1, int(base.min_area_ref * area_scale))
         self.max_area = max(self.min_area + 1, int(base.max_area_ref * area_scale))
@@ -128,7 +132,7 @@ class SimpleTracker:
         self,
         iou_threshold=0.3,
         max_missing=45,
-        roi_pad=15,
+        roi_pad=35,
         min_track_age=5,
         min_displacement=10.0,
     ):
@@ -168,8 +172,7 @@ class SimpleTracker:
     def _should_keep_track(self, track):
         return track["age"] >= self.min_track_age and self._track_displacement(track) >= self.min_displacement
 
-    def update(self, detections, frame, frame_id):
-        print(f"[frame {frame_id}] tracker input detections: {detections}")
+    def update(self, detections, frame):
         matched_track_ids = set()
         matched_det_indices = set()
 
@@ -179,7 +182,6 @@ class SimpleTracker:
             for i, det in enumerate(detections):
                 if i in matched_det_indices:
                     continue
-                print(f"[frame {frame_id}] new track created: id={self.next_id}, det={det}")
                 iou = self._iou(track["bbox"], det)
                 if iou > best_iou:
                     best_iou = iou
@@ -222,7 +224,6 @@ class SimpleTracker:
                 self.tracks[tid]["missing"] += 1
                 if self.tracks[tid]["missing"] > self.max_missing:
                     track = self.tracks[tid]
-                    print(f"[frame {frame_id}] track finished: id={tid}, age={track['age']}, missing={track['missing']}")
                     if self._should_keep_track(track):
                         finished.append(track)
                     ids_to_remove.append(tid)
@@ -261,21 +262,40 @@ def should_reject_edge_contour(cnt, frame_w, frame_h, area, w, h, params: Scaled
 
     return not params.allow_small_edge_objects
 
-def fill_holes(mask):
-    flood = mask.copy()
-    h, w = flood.shape
-    flood_fill_mask = np.zeros((h+2, w+2), np.uint8)
-    cv2.floodFill(flood, flood_fill_mask, (0, 0), 255)
-    filled = cv2.bitwise_not(flood)
-    return mask | filled
+
+def save_track(track, output_dir, roi_id, predictor, enable_cnn):
+    """
+    保存一条 track 的最佳 ROI，可选 CNN 推理。
+    - enable_cnn=True ：调用 predictor，junk 直接跳过不保存，target 才保存
+    - enable_cnn=False：跳过推理，直接保存所有 ROI
+    返回 True 表示实际写了文件，False 表示被 CNN 过滤掉了。
+    """
+    roi_img = track["best_roi"]
+
+    if enable_cnn:
+        # predictor.predict() 返回 (pred_label, conf) 元组
+        pred_label, conf = predictor.predict(roi_img)
+
+        if pred_label == "junk":
+            return False  # junk 不保存
+
+        # target：文件名带置信度，方便后续筛查
+        save_path = output_dir / f"roi_{roi_id:05d}_{pred_label}_{conf:.2f}.png"
+    else:
+        save_path = output_dir / f"roi_{roi_id:05d}.png"
+
+    cv2.imwrite(str(save_path), roi_img)
+    return True
+
+
 # -----------------------------------------------
 # 主函数
 # -----------------------------------------------
-def extract_roi(magnification=1.0):
+def extract_roi(magnification=1.0, enable_cnn=True):
     base_dir = Path(__file__).resolve().parent.parent.parent
-    video_path = base_dir / "data" / "video" / "sample2.avi"
-    output_dir = base_dir / "data" / "picture_best2"
-    debug_dir = base_dir / "data" / "debug_best2"
+    video_path = base_dir / "data" / "video" / "sample.avi"
+    output_dir = base_dir / "data" / "picture_best"
+    debug_dir = base_dir / "data" / "debug_best"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -290,9 +310,14 @@ def extract_roi(magnification=1.0):
 
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    params = build_scaled_params(magnification, (frame_w, frame_h))
+
+    # enable_cnn 参数优先于 profile 里的设置
+    profile = MAGNIFICATION_PROFILES.get(magnification, ROIParams())
+    profile.enable_cnn = enable_cnn
+    params = build_scaled_params(magnification, (frame_w, frame_h), profile)
 
     print(f"Using magnification: {magnification}x")
+    print(f"CNN enabled: {params.enable_cnn}")
     print(f"Frame size: {frame_w}x{frame_h}")
     print(f"Length scale: {params.length_scale:.3f}")
     print(
@@ -319,7 +344,9 @@ def extract_roi(magnification=1.0):
         min_track_age=params.min_track_age,
         min_displacement=params.min_displacement,
     )
-    predictor = ROIPredictor()
+
+    # 仅在需要时加载模型，避免不必要的初始化开销
+    predictor = ROIPredictor() if params.enable_cnn else None
 
     frame_id = 0
     roi_id = 0
@@ -344,41 +371,32 @@ def extract_roi(magnification=1.0):
 
         fg_filled = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, fill_kernel)
         fg_filled = cv2.morphologyEx(fg_filled, cv2.MORPH_OPEN, small_kernel)
-        fg_filled = fill_holes(fg_filled)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        thresh_mask = cv2.adaptiveThreshold(
+        gray_thresh = cv2.adaptiveThreshold(
             blur, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             blockSize=51,  # 局部区域大小，可调
             C=-10          # 负值=比局部均值亮的才算前景
         )
-        thresh_mask = cv2.morphologyEx(thresh_mask, cv2.MORPH_OPEN, small_kernel)
+        gray_thresh = cv2.morphologyEx(gray_thresh, cv2.MORPH_OPEN, small_kernel)
 
-        combined_mask = cv2.bitwise_and(fg_filled, thresh_mask)
-        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, merge_kernel)
-
-        final_mask = combined_mask.copy()
+        combined = cv2.bitwise_and(fg_filled, gray_thresh)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, merge_kernel)
 
         if frame_id <= params.debug_save_until_frame:
-            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_fgmask.png"), fg_mask)
-            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_thresh.png"), thresh_mask)
-            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_combined.png"), combined_mask)
-            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_final.png"), final_mask)
+            cv2.imwrite(str(debug_dir / f"frame_{frame_id}.png"), frame)
+            cv2.imwrite(str(debug_dir / f"fg_mask_{frame_id}.png"), fg_mask)
+            cv2.imwrite(str(debug_dir / f"thresh_{frame_id}.png"), combined)
 
-        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detections = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect_ratio = w / h if h != 0 else 0
-
-            print(f"[candidate] area={area:.1f}, x={x}, y={y}, w={w}, h={h}, ar={aspect_ratio:.2f}")
             if area < params.min_area or area > params.max_area:
-                print("filtered by area")
                 continue
 
             perimeter = cv2.arcLength(cnt, True)
@@ -387,70 +405,39 @@ def extract_roi(magnification=1.0):
 
             x, y, w, h = cv2.boundingRect(cnt)
             if w < params.min_w or h < params.min_h or w > params.max_w or h > params.max_h:
-                print("filtered by size")
                 continue
 
             aspect_ratio = w / h if h != 0 else 0
             if aspect_ratio < params.min_aspect_ratio or aspect_ratio > params.max_aspect_ratio:
-                print("filtered by aspect")
                 continue
 
             if should_reject_edge_contour(cnt, frame_w, frame_h, area, w, h, params):
                 continue
 
-            detections.append((x, y, w, h, area))
+            detections.append((x, y, w, h))
 
-         # 过滤循环结束后，统一画框保存debug图
-        if frame_id <= params.debug_save_until_frame:
-            debug_frame = frame.copy()
-            for idx, (x, y, w, h, area) in enumerate(detections):
-                cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                label = f"#{idx} a={area:.0f}"
-                cv2.putText(debug_frame, label, (x, max(y-5, 15)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.imwrite(str(debug_dir / f"frame_{frame_id:04d}_det.jpg"), debug_frame)
-
-        print(f"\nframe {frame_id} valid detections:")
-        for idx, (x, y, w, h, area) in enumerate(detections):
-            print(f"  det#{idx}: x={x}, y={y}, w={w}, h={h}, area={area:.1f}")
-
-        finished_tracks = tracker.update(
-            [(x,y,w,h) for x,y,w,h,area in detections],
-            frame,
-            frame_id
-        )
-
+        finished_tracks = tracker.update(detections, frame)
         for track in finished_tracks:
-            roi_img = track["best_roi"]
+            saved = save_track(track, output_dir, roi_id, predictor, params.enable_cnn)
+            if saved:
+                roi_id += 1
 
-            label, conf = predictor.predict(roi_img)
-
-            if label != "target":
-                continue
-
-            save_path = output_dir / f"roi_{roi_id:05d}.png"
-            cv2.imwrite(str(save_path), roi_img)
-            roi_id += 1
-
-    
         print(f"frame {frame_id} | detections: {len(detections)} | saved ROI: {roi_id}")
 
     for track in tracker.flush():
-        roi_img = track["best_roi"]
-
-        label, conf = predictor.predict(roi_img)
-
-        if label != "target":
-            continue
-
-        save_path = output_dir / f"roi_{roi_id:05d}_{conf:.2f}.png"
-        cv2.imwrite(str(save_path), roi_img)
-        roi_id += 1
+        saved = save_track(track, output_dir, roi_id, predictor, params.enable_cnn)
+        if saved:
+            roi_id += 1
 
     cap.release()
     print("Finished!")
+    print("CNN enabled:", params.enable_cnn)
     print("Total ROI saved:", roi_id)
 
 
 if __name__ == "__main__":
-    extract_roi(magnification=1.0)
+    # 开启 CNN（默认）：只保存 target，过滤 junk
+    extract_roi(magnification=1.0, enable_cnn=True)
+
+    # 关闭 CNN：保存所有 ROI，不做分类
+    # extract_roi(magnification=1.0, enable_cnn=False)
