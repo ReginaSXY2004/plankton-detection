@@ -15,7 +15,7 @@ REFERENCE_FRAME_SIZE = (2448, 2048)  # width, height for the known 1.0x video
 @dataclass
 class ROIParams:
     warmup_frames: int = 30
-    debug_save_until_frame: int = 35
+    debug_save_until_frame: int = 100
     gray_threshold: int = 35
 
     # contour filters (defined at 1.0x reference scale)
@@ -38,12 +38,12 @@ class ROIParams:
     # tracker
     tracker_iou_threshold: float = 0.3
     tracker_max_missing: int = 8
-    roi_pad_ref: int = 15
-    min_track_age: int = 5
-    min_displacement_ref: float = 10.0
+    roi_pad_ref: int = 30
+    min_track_age: int = 2
+    min_displacement_ref: float = 5
 
     # morphology kernels (defined at 1.0x reference scale)
-    fill_kernel_ref: int = 15
+    fill_kernel_ref: int = 25
     small_kernel_ref: int = 4
     merge_kernel_ref: int = 11
 
@@ -168,7 +168,8 @@ class SimpleTracker:
     def _should_keep_track(self, track):
         return track["age"] >= self.min_track_age and self._track_displacement(track) >= self.min_displacement
 
-    def update(self, detections, frame):
+    def update(self, detections, frame, frame_id):
+        print(f"[frame {frame_id}] tracker input detections: {detections}")
         matched_track_ids = set()
         matched_det_indices = set()
 
@@ -178,6 +179,7 @@ class SimpleTracker:
             for i, det in enumerate(detections):
                 if i in matched_det_indices:
                     continue
+                print(f"[frame {frame_id}] new track created: id={self.next_id}, det={det}")
                 iou = self._iou(track["bbox"], det)
                 if iou > best_iou:
                     best_iou = iou
@@ -220,6 +222,7 @@ class SimpleTracker:
                 self.tracks[tid]["missing"] += 1
                 if self.tracks[tid]["missing"] > self.max_missing:
                     track = self.tracks[tid]
+                    print(f"[frame {frame_id}] track finished: id={tid}, age={track['age']}, missing={track['missing']}")
                     if self._should_keep_track(track):
                         finished.append(track)
                     ids_to_remove.append(tid)
@@ -258,7 +261,13 @@ def should_reject_edge_contour(cnt, frame_w, frame_h, area, w, h, params: Scaled
 
     return not params.allow_small_edge_objects
 
-
+def fill_holes(mask):
+    flood = mask.copy()
+    h, w = flood.shape
+    flood_fill_mask = np.zeros((h+2, w+2), np.uint8)
+    cv2.floodFill(flood, flood_fill_mask, (0, 0), 255)
+    filled = cv2.bitwise_not(flood)
+    return mask | filled
 # -----------------------------------------------
 # 主函数
 # -----------------------------------------------
@@ -335,26 +344,41 @@ def extract_roi(magnification=1.0):
 
         fg_filled = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, fill_kernel)
         fg_filled = cv2.morphologyEx(fg_filled, cv2.MORPH_OPEN, small_kernel)
+        fg_filled = fill_holes(fg_filled)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, gray_thresh = cv2.threshold(blur, params.gray_threshold, 255, cv2.THRESH_BINARY)
-        gray_thresh = cv2.morphologyEx(gray_thresh, cv2.MORPH_OPEN, small_kernel)
+        thresh_mask = cv2.adaptiveThreshold(
+            blur, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=51,  # 局部区域大小，可调
+            C=-10          # 负值=比局部均值亮的才算前景
+        )
+        thresh_mask = cv2.morphologyEx(thresh_mask, cv2.MORPH_OPEN, small_kernel)
 
-        combined = cv2.bitwise_and(fg_filled, gray_thresh)
-        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, merge_kernel)
+        combined_mask = cv2.bitwise_and(fg_filled, thresh_mask)
+        combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, merge_kernel)
+
+        final_mask = combined_mask.copy()
 
         if frame_id <= params.debug_save_until_frame:
-            cv2.imwrite(str(debug_dir / f"frame_{frame_id}.png"), frame)
-            cv2.imwrite(str(debug_dir / f"fg_mask_{frame_id}.png"), fg_mask)
-            cv2.imwrite(str(debug_dir / f"thresh_{frame_id}.png"), combined)
+            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_fgmask.png"), fg_mask)
+            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_thresh.png"), thresh_mask)
+            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_combined.png"), combined_mask)
+            cv2.imwrite(str(debug_dir / f"{frame_id:04d}_final.png"), final_mask)
 
-        contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         detections = []
         for cnt in contours:
             area = cv2.contourArea(cnt)
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect_ratio = w / h if h != 0 else 0
+
+            print(f"[candidate] area={area:.1f}, x={x}, y={y}, w={w}, h={h}, ar={aspect_ratio:.2f}")
             if area < params.min_area or area > params.max_area:
+                print("filtered by area")
                 continue
 
             perimeter = cv2.arcLength(cnt, True)
@@ -363,38 +387,69 @@ def extract_roi(magnification=1.0):
 
             x, y, w, h = cv2.boundingRect(cnt)
             if w < params.min_w or h < params.min_h or w > params.max_w or h > params.max_h:
+                print("filtered by size")
                 continue
 
             aspect_ratio = w / h if h != 0 else 0
             if aspect_ratio < params.min_aspect_ratio or aspect_ratio > params.max_aspect_ratio:
+                print("filtered by aspect")
                 continue
 
             if should_reject_edge_contour(cnt, frame_w, frame_h, area, w, h, params):
                 continue
 
-            detections.append((x, y, w, h))
+            detections.append((x, y, w, h, area))
 
-        finished_tracks = tracker.update(detections, frame)
+         # 过滤循环结束后，统一画框保存debug图
+        if frame_id <= params.debug_save_until_frame:
+            debug_frame = frame.copy()
+            for idx, (x, y, w, h, area) in enumerate(detections):
+                cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                label = f"#{idx} a={area:.0f}"
+                cv2.putText(debug_frame, label, (x, max(y-5, 15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            cv2.imwrite(str(debug_dir / f"frame_{frame_id:04d}_det.jpg"), debug_frame)
+
+        print(f"\nframe {frame_id} valid detections:")
+        for idx, (x, y, w, h, area) in enumerate(detections):
+            print(f"  det#{idx}: x={x}, y={y}, w={w}, h={h}, area={area:.1f}")
+
+        finished_tracks = tracker.update(
+            [(x,y,w,h) for x,y,w,h,area in detections],
+            frame,
+            frame_id
+        )
+
         for track in finished_tracks:
             roi_img = track["best_roi"]
+
+            label, conf = predictor.predict(roi_img)
+
+            if label != "target":
+                continue
 
             save_path = output_dir / f"roi_{roi_id:05d}.png"
             cv2.imwrite(str(save_path), roi_img)
             roi_id += 1
 
-
+    
         print(f"frame {frame_id} | detections: {len(detections)} | saved ROI: {roi_id}")
 
     for track in tracker.flush():
         roi_img = track["best_roi"]
 
-        save_path = output_dir / f"roi_{roi_id:05d}.png"
+        label, conf = predictor.predict(roi_img)
+
+        if label != "target":
+            continue
+
+        save_path = output_dir / f"roi_{roi_id:05d}_{conf:.2f}.png"
         cv2.imwrite(str(save_path), roi_img)
         roi_id += 1
 
-        cap.release()
-        print("Finished!")
-        print("Total ROI saved:", roi_id)
+    cap.release()
+    print("Finished!")
+    print("Total ROI saved:", roi_id)
 
 
 if __name__ == "__main__":
