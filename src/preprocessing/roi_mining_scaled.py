@@ -11,6 +11,7 @@ from inference.roi_predictor import ROIPredictor
 REFERENCE_MAGNIFICATION = 1.0
 REFERENCE_FRAME_SIZE = (2448, 2048)  # width, height for the known 1.0x video
 
+
 @dataclass
 class ROIParams:
     warmup_frames: int = 30
@@ -36,9 +37,9 @@ class ROIParams:
 
     # tracker
     tracker_iou_threshold: float = 0.3
-    tracker_max_missing: int = 45 #物体短暂离开视野/被遮挡时，等待更多帧再放弃这条 track，而不是马上新建一条
+    tracker_max_missing: int = 45
     roi_pad_ref: int = 18
-    min_track_age: int = 2 # 新建的 track 必须连续存活这么多帧才算有效
+    min_track_age: int = 2
     min_displacement_ref: float = 10
 
     # morphology kernels (defined at 1.0x reference scale)
@@ -134,14 +135,12 @@ class SimpleTracker:
         roi_pad=35,
         min_track_age=5,
         min_displacement=10.0,
-        center_distance_threshold=35.0,
     ):
         self.iou_threshold = iou_threshold
         self.max_missing = max_missing
         self.roi_pad = roi_pad
         self.min_track_age = min_track_age
         self.min_displacement = min_displacement
-        self.center_distance_threshold = center_distance_threshold
         self.next_id = 0
         self.tracks = {}
 
@@ -154,18 +153,6 @@ class SimpleTracker:
         inter = ix * iy
         union = w1 * h1 + w2 * h2 - inter
         return inter / union if union > 0 else 0
-    
-    @staticmethod
-    def _center(bbox):
-        x, y, w, h = bbox
-        return (x + w / 2.0, y + h / 2.0)
-
-    def _center_distance(self, b1, b2):
-        c1x, c1y = self._center(b1)
-        c2x, c2y = self._center(b2)
-        dx = c1x - c2x
-        dy = c1y - c2y
-        return (dx ** 2 + dy ** 2) ** 0.5
 
     def _crop_roi(self, frame, det):
         frame_h, frame_w = frame.shape[:2]
@@ -178,19 +165,9 @@ class SimpleTracker:
         return frame[y1:y2, x1:x2]
 
     def _track_displacement(self, track):
-        centers = track["centers"]
-        if len(centers) < 2:
-            return 0.0
-
-        max_dist = 0.0
-        for i in range(len(centers)):
-            x1, y1 = centers[i]
-            for j in range(i + 1, len(centers)):
-                x2, y2 = centers[j]
-                dist = ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
-                if dist > max_dist:
-                    max_dist = dist
-        return max_dist
+        dx = track["bbox"][0] - track["start_bbox"][0]
+        dy = track["bbox"][1] - track["start_bbox"][1]
+        return (dx ** 2 + dy ** 2) ** 0.5
 
     def _should_keep_track(self, track):
         return track["age"] >= self.min_track_age and self._track_displacement(track) >= self.min_displacement
@@ -198,28 +175,17 @@ class SimpleTracker:
     def update(self, detections, frame):
         matched_track_ids = set()
         matched_det_indices = set()
-        new_track_ids = set()
 
-        # 1. 先尝试把 detection 匹配到已有 track
         for tid, track in self.tracks.items():
+            best_iou = self.iou_threshold
             best_det_idx = -1
-            best_dist = float("inf")
-            best_iou = 0.0
-
             for i, det in enumerate(detections):
                 if i in matched_det_indices:
                     continue
-
-                dist = self._center_distance(track["bbox"], det)
                 iou = self._iou(track["bbox"], det)
-
-                # 满足“距离近”或“IoU高”才允许匹配
-                if dist <= self.center_distance_threshold or iou >= self.iou_threshold:
-                    # 优先选距离最近的；如果距离一样，再选 IoU 更高的
-                    if dist < best_dist or (abs(dist - best_dist) < 1e-6 and iou > best_iou):
-                        best_dist = dist
-                        best_iou = iou
-                        best_det_idx = i
+                if iou > best_iou:
+                    best_iou = iou
+                    best_det_idx = i
 
             if best_det_idx >= 0:
                 matched_track_ids.add(tid)
@@ -233,37 +199,28 @@ class SimpleTracker:
                     track["best_sharpness"] = sharpness
 
                 track["bbox"] = det
-                track["centers"].append(self._center(det))
                 track["missing"] = 0
                 track["age"] += 1
 
-        # 2. 没匹配上的 detection，新建 track
         for i, det in enumerate(detections):
             if i in matched_det_indices:
                 continue
-
             roi = self._crop_roi(frame, det)
             sharpness = compute_sharpness(roi)
-
-            tid = self.next_id
-            self.tracks[tid] = {
+            self.tracks[self.next_id] = {
                 "age": 0,
                 "start_bbox": det,
                 "bbox": det,
-                "centers": [self._center(det)],
                 "missing": 0,
                 "best_roi": roi.copy(),
                 "best_sharpness": sharpness,
             }
-            new_track_ids.add(tid)
             self.next_id += 1
 
-        # 3. 只给“旧的且这帧没匹配上”的 track 增加 missing
         finished = []
         ids_to_remove = []
-
         for tid in list(self.tracks.keys()):
-            if tid not in matched_track_ids and tid not in new_track_ids:
+            if tid not in matched_track_ids:
                 self.tracks[tid]["missing"] += 1
                 if self.tracks[tid]["missing"] > self.max_missing:
                     track = self.tracks[tid]
@@ -275,7 +232,7 @@ class SimpleTracker:
             del self.tracks[tid]
 
         return finished
-    
+
     def flush(self):
         remaining = [t for t in self.tracks.values() if self._should_keep_track(t)]
         self.tracks.clear()
@@ -386,7 +343,6 @@ def extract_roi(magnification=1.0, enable_cnn=True):
         roi_pad=params.roi_pad,
         min_track_age=params.min_track_age,
         min_displacement=params.min_displacement,
-        center_distance_threshold=max(params.min_w, params.min_h) * 1.2,
     )
 
     # 仅在需要时加载模型，避免不必要的初始化开销
