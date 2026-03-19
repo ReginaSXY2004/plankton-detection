@@ -6,24 +6,15 @@ from preprocessing.background_subtraction import (
     create_background_subtractor,
     subtract_background,
 )
+from inference.roi_predictor import ROIPredictor
 
-
-# --------------------------------------------------
-# 参数
-# --------------------------------------------------
 
 @dataclass
 class DatasetParams:
-    # 前面若干帧给背景建模
     warmup_frames: int = 30
-
-    # 不是每一帧都保存，降低重复度
     frame_stride: int = 5
-
-    # 至少有多少个候选框才保存这一帧
     min_boxes_to_save_frame: int = 1
 
-    # contour 基础筛选
     min_area: int = 700
     max_area: int = 20000
 
@@ -35,28 +26,32 @@ class DatasetParams:
     min_aspect_ratio: float = 0.15
     max_aspect_ratio: float = 6.5
 
-    # 形态学参数
     fill_kernel: int = 15
     small_kernel: int = 4
     merge_kernel: int = 11
 
-    # 清晰度过滤（针对每个候选框）
     sharpness_threshold: float = 40.0
-
-    # NMS 去重阈值
     nms_iou_threshold: float = 0.35
-
-    # 是否保存调试可视化
     save_debug_vis: bool = True
 
+    # CNN 二分类开关
+    enable_cnn: bool = True
+    cnn_roi_pad: int = 18
+    cnn_conf_threshold: float = 0.80
 
-# --------------------------------------------------
-# 基础工具
-# --------------------------------------------------
 
 def compute_sharpness(roi):
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def crop_box_with_pad(frame, x, y, w, h, pad):
+    frame_h, frame_w = frame.shape[:2]
+    x1 = max(x - pad, 0)
+    y1 = max(y - pad, 0)
+    x2 = min(x + w + pad, frame_w)
+    y2 = min(y + h + pad, frame_h)
+    return frame[y1:y2, x1:x2]
 
 
 def bbox_to_yolo(x, y, w, h, frame_w, frame_h):
@@ -95,11 +90,6 @@ def iou_xywh(box1, box2):
 
 
 def nms_boxes(boxes, scores, iou_thresh=0.35):
-    """
-    boxes: [(x,y,w,h), ...]
-    scores: [score, ...]
-    返回保留后的 boxes
-    """
     if not boxes:
         return []
 
@@ -126,11 +116,7 @@ def draw_boxes(frame, boxes, color=(0, 255, 0), thickness=2):
     return vis
 
 
-# --------------------------------------------------
-# 检测逻辑
-# --------------------------------------------------
-
-def detect(frame, fg_mask, params: DatasetParams):
+def detect(frame, fg_mask, params: DatasetParams, predictor=None):
     fill_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (params.fill_kernel, params.fill_kernel)
     )
@@ -141,11 +127,9 @@ def detect(frame, fg_mask, params: DatasetParams):
         cv2.MORPH_ELLIPSE, (params.merge_kernel, params.merge_kernel)
     )
 
-    # 背景减除结果做形态学清理
     fg_filled = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, fill_kernel)
     fg_filled = cv2.morphologyEx(fg_filled, cv2.MORPH_OPEN, small_kernel)
 
-    # 灰度阈值分割
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -159,7 +143,6 @@ def detect(frame, fg_mask, params: DatasetParams):
     )
     gray_thresh = cv2.morphologyEx(gray_thresh, cv2.MORPH_OPEN, small_kernel)
 
-    # 交集：尽量保留“既有前景变化，又有亮目标特征”的区域
     combined = cv2.bitwise_and(fg_filled, gray_thresh)
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, merge_kernel)
 
@@ -182,7 +165,6 @@ def detect(frame, fg_mask, params: DatasetParams):
 
         if w <= 1 or h <= 1:
             continue
-
         if w < params.min_w or h < params.min_h:
             continue
         if w > params.max_w or h > params.max_h:
@@ -200,20 +182,23 @@ def detect(frame, fg_mask, params: DatasetParams):
         if sharpness < params.sharpness_threshold:
             continue
 
-        # 用 sharpness + area 当一个很粗的 score，给 NMS 排序
-        score = float(sharpness) + 0.01 * float(area)
+        # 可选 CNN 二分过滤
+        if params.enable_cnn and predictor is not None:
+            roi_for_cnn = crop_box_with_pad(frame, x, y, w, h, params.cnn_roi_pad)
+            if roi_for_cnn.size == 0:
+                continue
 
+            pred_label, conf = predictor.predict(roi_for_cnn)
+            if pred_label == "junk" and conf >= params.cnn_conf_threshold:
+                continue
+
+        score = float(sharpness) + 0.01 * float(area)
         boxes.append((x, y, w, h))
         scores.append(score)
 
-    # 同一帧内做去重
     boxes = nms_boxes(boxes, scores, iou_thresh=params.nms_iou_threshold)
     return boxes
 
-
-# --------------------------------------------------
-# 主流程
-# --------------------------------------------------
 
 def build_dataset():
     base_dir = Path(__file__).resolve().parent.parent.parent
@@ -229,17 +214,18 @@ def build_dataset():
     labels_dir.mkdir(parents=True, exist_ok=True)
 
     params = DatasetParams()
+    predictor = ROIPredictor() if params.enable_cnn else None
 
     if params.save_debug_vis:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-    # YOLO 类别表
     classes_txt = labels_dir / "classes.txt"
     with open(classes_txt, "w", encoding="utf-8") as f:
         f.write("microbe\njunk\n")
 
     videos = sorted(video_dir.glob("*.avi"))
     print("videos:", len(videos))
+    print("CNN enabled:", params.enable_cnn)
 
     total_saved_frames = 0
     total_saved_boxes = 0
@@ -268,14 +254,12 @@ def build_dataset():
             if frame_id <= params.warmup_frames:
                 continue
 
-            # 不是每一帧都考虑保存，降低相邻重复
             if frame_id % params.frame_stride != 0:
                 continue
 
             fg_mask = subtract_background(back_sub, frame)
-            frame_boxes = detect(frame, fg_mask, params)
+            frame_boxes = detect(frame, fg_mask, params, predictor=predictor)
 
-            # 没有候选框就不保存这一帧
             if len(frame_boxes) < params.min_boxes_to_save_frame:
                 continue
 
@@ -295,8 +279,6 @@ def build_dataset():
             with open(label_path, "w", encoding="utf-8") as f:
                 for (x, y, w, h) in frame_boxes:
                     xc, yc, wn, hn = bbox_to_yolo(x, y, w, h, frame_w, frame_h)
-                    # 当前自动框统一先写成 class 0 = microbe
-                    # 后续人工删杂质、补漏框；若真要保留杂质类，再改成 1
                     f.write(f"0 {xc:.6f} {yc:.6f} {wn:.6f} {hn:.6f}\n")
 
             if params.save_debug_vis:
