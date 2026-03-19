@@ -3,14 +3,16 @@ venv/
 plankton_env/
 
 # datasets
-data/picture/
-data/picture_gray/
-<<<<<<< Updated upstream
-=======
-data/picture_merged/
 data/picture_best/
->>>>>>> Stashed changes
+data/debug_best/
+data/picture_best2/
+data/debug_best2/
+data/train/
+data/val/
 data/video/
+
+
+data/yolo_dataset/
 
 # python cache
 __pycache__/
