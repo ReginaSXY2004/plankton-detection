@@ -12,20 +12,35 @@ VIDEO_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\data\vide
 OUT_VIDEO = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\microbe_track_custom.avi"
 OUT_CSV = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\microbe_track_custom.csv"
 
+# 新增：每个有效 ID 的汇总信息
+OUT_CONFIRMED_CSV = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\confirmed_microbes.csv"
+
+# 新增：保存每个 ID 最佳图
+BEST_CROP_DIR = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\best_crops"
+
 DEVICE = 0
 
 # ===== 当前视频倍率 =====
-# 可选：1.0 / 0.5 / 0.2 / 2.0
 MAGNIFICATION = 0.5
+
+# ===== 实时确认 / 存图参数 =====
+# 只对“已经 visible 的轨迹”再加这一层工程判定
+BEST_MIN_W = 12                 # 框太小不更新最佳图
+BEST_MIN_H = 12
+BEST_MIN_CONF = 0.20            # 低于这个置信度不更新最佳图
+BEST_MIN_SHARPNESS = 60.0       # 低于这个清晰度不更新最佳图（可后续再调）
+SAVE_MIN_SHARPNESS = 80.0       # 最终落盘至少达到这个清晰度
+SAVE_MIN_CONF = 0.22            # 最终落盘至少达到这个置信度
+
+# 计数规则：visible track 首次达到这里就计数一次
+CONFIRM_MIN_HITS = 6
+
+# 最终写 confirmed_csv / 保存 best crop 的时机：
+# 轨迹连续丢失多少帧后，认为结束
+FINALIZE_MISSED_THRESH = 8
 
 
 def get_infer_config(magnification: float):
-    """
-    方法B：不缩放图像，直接按倍率调整 YOLO 和 tracker 参数
-    这些参数是经验版，不是绝对真理，先拿来测试很合适。
-    """
-
-    # 默认按 1x
     config = {
         "conf": 0.25,
         "imgsz": 640,
@@ -46,10 +61,6 @@ def get_infer_config(magnification: float):
         return config
 
     elif magnification == 0.5:
-        # 目标更小、更糊，所以：
-        # - 降低检测阈值，提升召回
-        # - 提高 imgsz，帮助小目标
-        # - tracker 空间阈值整体收缩
         config = {
             "conf": 0.18,
             "imgsz": 960,
@@ -68,7 +79,6 @@ def get_infer_config(magnification: float):
         return config
 
     elif magnification == 0.2:
-        # 更极端的小目标场景，先给更保守的召回导向参数
         config = {
             "conf": 0.12,
             "imgsz": 1280,
@@ -87,7 +97,6 @@ def get_infer_config(magnification: float):
         return config
 
     elif magnification == 2.0:
-        # 目标更大，所以可以更严格一点
         config = {
             "conf": 0.28,
             "imgsz": 640,
@@ -109,6 +118,7 @@ def get_infer_config(magnification: float):
         print(f"[warning] 未定义倍率 {magnification}x，自动按 1.0x 参数运行。")
         return config
 
+
 def compute_circularity_from_roi(frame, det):
     x1, y1, x2, y2 = map(int, [det.x1, det.y1, det.x2, det.y2])
 
@@ -128,7 +138,6 @@ def compute_circularity_from_roi(frame, det):
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # 用 Otsu 自动阈值，尽量抓住亮斑主体
     _, binary = cv2.threshold(
         blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
@@ -148,6 +157,7 @@ def compute_circularity_from_roi(frame, det):
     texture_std = float(np.std(gray))
     return circularity, texture_std
 
+
 def filter_blob_like_detections(frame, detections,
                                 circularity_thresh=0.82,
                                 texture_std_thresh=18.0,
@@ -158,40 +168,22 @@ def filter_blob_like_detections(frame, detections,
         bw = det.x2 - det.x1
         bh = det.y2 - det.y1
 
-        # 太小的框先不过滤太狠，避免误杀小微生物
         if bw < min_box_size or bh < min_box_size:
             kept.append(det)
             continue
 
         circularity, texture_std = compute_circularity_from_roi(frame, det)
 
-        # 算不出来就先保留
         if circularity is None:
             kept.append(det)
             continue
 
-        # 很圆 + 纹理很弱，判成光斑
         if circularity > circularity_thresh and texture_std < texture_std_thresh:
             continue
 
         kept.append(det)
 
     return kept
-
-def draw_track(frame, tr):
-    x1, y1, x2, y2 = map(int, tr.bbox)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-    text = f"id:{tr.track_id} conf:{tr.conf:.2f}"
-    cv2.putText(
-        frame,
-        text,
-        (x1, max(15, y1 - 6)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (0, 255, 0),
-        1,
-        cv2.LINE_AA
-    )
 
 
 def box_iou_xyxy(a, b):
@@ -214,9 +206,6 @@ def box_iou_xyxy(a, b):
 
 
 def deduplicate_detections(detections, iou_thresh=0.65, center_thresh=18):
-    """
-    同一帧里先去掉很近的重复框，避免同一目标喂给 tracker 两次
-    """
     detections = sorted(detections, key=lambda d: d.conf, reverse=True)
     kept = []
 
@@ -239,6 +228,100 @@ def deduplicate_detections(detections, iou_thresh=0.65, center_thresh=18):
     return kept
 
 
+def compute_sharpness(roi_bgr: np.ndarray) -> float:
+    if roi_bgr is None or roi_bgr.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def safe_crop(frame: np.ndarray, bbox):
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(int(round(x1)), w - 1))
+    y1 = max(0, min(int(round(y1)), h - 1))
+    x2 = max(0, min(int(round(x2)), w))
+    y2 = max(0, min(int(round(y2)), h))
+    if x2 <= x1 or y2 <= y1:
+        return None, (x1, y1, x2, y2)
+    return frame[y1:y2, x1:x2].copy(), (x1, y1, x2, y2)
+
+
+def should_consider_best(tr, crop: np.ndarray, sharpness: float) -> bool:
+    if crop is None or crop.size == 0:
+        return False
+    h, w = crop.shape[:2]
+    if w < BEST_MIN_W or h < BEST_MIN_H:
+        return False
+    if tr.conf < BEST_MIN_CONF:
+        return False
+    if sharpness < BEST_MIN_SHARPNESS:
+        return False
+    return True
+
+
+def best_score(sharpness: float, conf: float, area: float) -> float:
+    # 清晰度优先，其次置信度和面积
+    return sharpness * 1.0 + conf * 120.0 + min(area, 2500.0) * 0.01
+
+
+def draw_track(frame, tr, is_confirmed=False, counted=False):
+    x1, y1, x2, y2 = map(int, tr.bbox)
+    color = (0, 255, 0) if is_confirmed else (0, 180, 255)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+
+    flags = []
+    if is_confirmed:
+        flags.append("ok")
+    if counted:
+        flags.append("counted")
+    flag_text = f" [{'|'.join(flags)}]" if flags else ""
+
+    text = f"id:{tr.track_id} conf:{tr.conf:.2f}{flag_text}"
+    cv2.putText(
+        frame,
+        text,
+        (x1, max(15, y1 - 6)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        color,
+        1,
+        cv2.LINE_AA
+    )
+
+
+def finalize_track_record(tid, rec, confirmed_writer, best_crop_dir: Path):
+    if rec["finalized"]:
+        return
+
+    rec["finalized"] = True
+
+    # 写 confirmed CSV
+    confirmed_writer.writerow([
+        tid,
+        rec["counted"],
+        rec["saved"],
+        rec["first_frame"],
+        rec["last_frame"],
+        rec["best_frame"],
+        round(rec["best_conf"], 4),
+        round(rec["best_sharpness"], 2),
+        rec["best_w"],
+        rec["best_h"],
+    ])
+
+    # 保存最佳图：只对 counted 且 best 质量过关的目标保存
+    if (
+        rec["counted"]
+        and rec["best_crop"] is not None
+        and rec["best_sharpness"] >= SAVE_MIN_SHARPNESS
+        and rec["best_conf"] >= SAVE_MIN_CONF
+    ):
+        out_path = best_crop_dir / f"id_{tid:03d}_frame_{rec['best_frame']:05d}.png"
+        cv2.imwrite(str(out_path), rec["best_crop"])
+        rec["saved"] = True
+
+
 def main():
     cfg = get_infer_config(MAGNIFICATION)
 
@@ -257,11 +340,19 @@ def main():
     print("=" * 60)
 
     model = YOLO(MODEL_PATH)
-
     tracker = MicrobeTracker(**cfg["tracker"])
 
     out_video_path = Path(OUT_VIDEO)
     out_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    csv_path = Path(OUT_CSV)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    confirmed_csv_path = Path(OUT_CONFIRMED_CSV)
+    confirmed_csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    best_crop_dir = Path(BEST_CROP_DIR)
+    best_crop_dir.mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
@@ -281,14 +372,25 @@ def main():
         (width, height)
     )
 
-    csv_path = Path(OUT_CSV)
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    # track_id -> record
+    track_records = {}
+    realtime_count = 0
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        csv_writer = csv.writer(f)
+    with open(csv_path, "w", newline="", encoding="utf-8") as f_track, \
+         open(confirmed_csv_path, "w", newline="", encoding="utf-8") as f_confirmed:
+
+        csv_writer = csv.writer(f_track)
+        confirmed_writer = csv.writer(f_confirmed)
+
         csv_writer.writerow([
             "frame_idx", "track_id", "conf",
             "x1", "y1", "x2", "y2", "cx", "cy", "w", "h", "hits", "missed"
+        ])
+
+        confirmed_writer.writerow([
+            "track_id", "counted", "saved",
+            "first_frame", "last_frame", "best_frame",
+            "best_conf", "best_sharpness", "best_w", "best_h"
         ])
 
         frame_idx = 0
@@ -340,8 +442,59 @@ def main():
 
             tracks = tracker.update(detections)
 
+            visible_ids = set()
+
+            # 只对 visible tracks 做显示、逐帧CSV、实时确认逻辑
             for tr in tracks:
-                draw_track(frame, tr)
+                tid = tr.track_id
+                visible_ids.add(tid)
+
+                if tid not in track_records:
+                    track_records[tid] = {
+                        "first_frame": frame_idx,
+                        "last_frame": frame_idx,
+                        "best_frame": -1,
+                        "best_conf": 0.0,
+                        "best_sharpness": 0.0,
+                        "best_w": 0,
+                        "best_h": 0,
+                        "best_crop": None,
+                        "best_score": -1e9,
+                        "counted": False,
+                        "saved": False,
+                        "finalized": False,
+                    }
+
+                rec = track_records[tid]
+                rec["last_frame"] = frame_idx
+
+                crop, clipped_bbox = safe_crop(frame, tr.bbox)
+                sharpness = compute_sharpness(crop) if crop is not None else 0.0
+                area = float((tr.x2 - tr.x1) * (tr.y2 - tr.y1))
+
+                if should_consider_best(tr, crop, sharpness):
+                    score = best_score(sharpness, tr.conf, area)
+                    if score > rec["best_score"]:
+                        rec["best_score"] = score
+                        rec["best_frame"] = frame_idx
+                        rec["best_conf"] = tr.conf
+                        rec["best_sharpness"] = sharpness
+                        rec["best_w"] = 0 if crop is None else crop.shape[1]
+                        rec["best_h"] = 0 if crop is None else crop.shape[0]
+                        rec["best_crop"] = None if crop is None else crop.copy()
+
+                # 实时计数：只计一次
+                if (not rec["counted"]) and tr.hits >= CONFIRM_MIN_HITS:
+                    rec["counted"] = True
+                    realtime_count += 1
+
+                draw_track(
+                    frame,
+                    tr,
+                    is_confirmed=(tr.hits >= CONFIRM_MIN_HITS),
+                    counted=rec["counted"]
+                )
+
                 x1, y1, x2, y2 = tr.bbox
                 w = x2 - x1
                 h = y2 - y1
@@ -361,6 +514,17 @@ def main():
                     tr.missed
                 ])
 
+            # 对 tracker 里已经“长期丢失”的轨迹做 finalize
+            for tid, tr in list(tracker.tracks.items()):
+                if tid not in track_records:
+                    continue
+                rec = track_records[tid]
+                if rec["finalized"]:
+                    continue
+
+                if tr.missed >= FINALIZE_MISSED_THRESH:
+                    finalize_track_record(tid, rec, confirmed_writer, best_crop_dir)
+
             cv2.putText(
                 frame,
                 f"frame:{frame_idx}",
@@ -372,13 +536,33 @@ def main():
                 cv2.LINE_AA
             )
 
+            cv2.putText(
+                frame,
+                f"count:{realtime_count}",
+                (10, 55),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 200, 255),
+                2,
+                cv2.LINE_AA
+            )
+
             writer.write(frame)
             frame_idx += 1
 
+        # 视频结束后，把还没 finalize 的也统一 finalize
+        for tid, rec in track_records.items():
+            if not rec["finalized"]:
+                finalize_track_record(tid, rec, confirmed_writer, best_crop_dir)
+
     cap.release()
     writer.release()
+
     print(f"完成：{OUT_VIDEO}")
-    print(f"CSV：{OUT_CSV}")
+    print(f"逐帧CSV：{OUT_CSV}")
+    print(f"确认目标CSV：{OUT_CONFIRMED_CSV}")
+    print(f"最佳图目录：{BEST_CROP_DIR}")
+    print(f"实时计数结果：{realtime_count}")
 
 
 if __name__ == "__main__":
