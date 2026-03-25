@@ -151,7 +151,7 @@ class MicrobeTracker:
     def __init__(
         self,
         max_missing: int = 12,
-        min_hits_to_show: int = 2,
+        min_hits_to_show: int = 5,
         base_distance_thresh: float = 25.0,
         distance_scale: float = 1.5,
         max_size_ratio: float = 2.2,
@@ -178,7 +178,7 @@ class MicrobeTracker:
 
         for tid, tr in self.tracks.items():
             # 只考虑刚丢失不久的轨迹
-            if tr.missed < 1 or tr.missed > 3:
+            if tr.missed < 1 or tr.missed > 10:
                 continue
 
             # 框变化太大就不接
@@ -187,8 +187,8 @@ class MicrobeTracker:
 
             dist = self._center_distance(tr.cx, tr.cy, det.cx, det.cy)
             reconnect_thresh = max(
-                self.base_distance_thresh * 1.2,
-                max(tr.w, tr.h, det.w, det.h) * self.distance_scale
+                self.base_distance_thresh * 1.5,
+                max(tr.w, tr.h, det.w, det.h) * (self.distance_scale+0.2)
             )
 
             if dist > reconnect_thresh:
@@ -332,7 +332,7 @@ class MicrobeTracker:
     def _too_close_to_existing_track(self, det: Detection) -> bool:
         for tr in self.tracks.values():
             # 不只看活跃轨迹，也看短暂丢失的轨迹，避免旧 ID 旁边重新出生
-            if tr.missed > min(self.max_missing, 3):
+            if tr.missed > min(self.max_missing, 6):
                 continue
 
             d = self._center_distance(tr.cx, tr.cy, det.cx, det.cy)
