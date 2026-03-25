@@ -1,7 +1,7 @@
 from pathlib import Path
 import pandas as pd
 
-CSV_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\track_results.csv"
+CSV_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\microbe_track_custom.csv"
 OUT_SUMMARY = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\track_summary.csv"
 
 
