@@ -159,6 +159,7 @@ class MicrobeTracker:
         max_speed_px: float = 60.0,
         speed_scale: float = 3.0,
         no_spawn_radius: float = 30.0,
+        debug_print: bool = False,
     ):
         self.max_missing = max_missing
         self.min_hits_to_show = min_hits_to_show
@@ -169,6 +170,7 @@ class MicrobeTracker:
         self.max_speed_px = max_speed_px
         self.speed_scale = speed_scale
         self.no_spawn_radius = no_spawn_radius
+        self.debug_print = debug_print
 
         self.tracks: Dict[int, Track] = {}
         self.next_id = 1
@@ -483,5 +485,6 @@ class MicrobeTracker:
             if tr.hits >= self.min_hits_to_show and tr.missed <= 1
         ]
         visible_tracks = self._prune_overlapping_visible_tracks(visible_tracks)
-        print(f"active_tracks: {len(self.tracks)} | visible: {len(visible_tracks)}")
+        if self.debug_print:
+            print(f"active_tracks: {len(self.tracks)} | visible: {len(visible_tracks)}")
         return visible_tracks
