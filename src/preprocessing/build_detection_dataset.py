@@ -6,52 +6,134 @@ from preprocessing.background_subtraction import (
     create_background_subtractor,
     subtract_background,
 )
-from inference.roi_predictor import ROIPredictor
 
+# --------------------------------------------------
+# 参考尺度
+# 你现在这套阈值是按 1.0x / 2448x2048 调出来的
+# --------------------------------------------------
+
+REFERENCE_MAGNIFICATION = 1.0
+REFERENCE_FRAME_SIZE = (2448, 2048)  # width, height
+
+
+# --------------------------------------------------
+# 基础参数（定义在参考尺度上）
+# --------------------------------------------------
 
 @dataclass
 class DatasetParams:
+    # 前面若干帧给背景建模
     warmup_frames: int = 30
+
+    # 不是每一帧都保存，降低重复度
     frame_stride: int = 5
+
+    # 至少有多少个候选框才保存这一帧
     min_boxes_to_save_frame: int = 1
 
-    min_area: int = 700
-    max_area: int = 20000
+    # contour 基础筛选（按 1.0x 参考尺度定义）
+    min_area_ref: float = 700.0
+    max_area_ref: float = 20000.0
 
-    min_w: int = 25
-    min_h: int = 25
-    max_w: int = 300
-    max_h: int = 300
+    min_w_ref: int = 25
+    min_h_ref: int = 25
+    max_w_ref: int = 300
+    max_h_ref: int = 300
 
     min_aspect_ratio: float = 0.15
     max_aspect_ratio: float = 6.5
 
-    fill_kernel: int = 15
-    small_kernel: int = 4
-    merge_kernel: int = 11
+    # 形态学参数（按 1.0x 参考尺度定义）
+    fill_kernel_ref: int = 15
+    small_kernel_ref: int = 4
+    merge_kernel_ref: int = 11
 
+    # 清晰度过滤（先不缩放）
     sharpness_threshold: float = 40.0
+
+    # NMS 去重阈值
     nms_iou_threshold: float = 0.35
+
+    # 是否保存调试可视化
     save_debug_vis: bool = True
 
-    # CNN 二分类开关
-    enable_cnn: bool = True
-    cnn_roi_pad: int = 18
-    cnn_conf_threshold: float = 0.80
 
+# 你现在老相机下的倍率 profile
+# 目前先都共用同一套参考参数，真正差异靠 magnification 缩放
+MAGNIFICATION_PROFILES = {
+    1.0: DatasetParams(),
+    0.5: DatasetParams(),
+    0.2: DatasetParams(),
+    2.0: DatasetParams(),
+}
+
+
+# --------------------------------------------------
+# 缩放后的参数容器
+# --------------------------------------------------
+
+class ScaledDatasetParams:
+    def __init__(self, base: DatasetParams, magnification: float, frame_size: tuple[int, int]):
+        frame_w, frame_h = frame_size
+        ref_w, ref_h = REFERENCE_FRAME_SIZE
+
+        mag_scale = magnification / REFERENCE_MAGNIFICATION
+        res_scale_x = frame_w / ref_w
+        res_scale_y = frame_h / ref_h
+
+        # 长度缩放：倍率 * 分辨率缩放
+        length_scale = mag_scale * (res_scale_x + res_scale_y) / 2.0
+        area_scale = max(length_scale ** 2, 1e-6)
+
+        self.warmup_frames = base.warmup_frames
+        self.frame_stride = base.frame_stride
+        self.min_boxes_to_save_frame = base.min_boxes_to_save_frame
+
+        self.min_aspect_ratio = base.min_aspect_ratio
+        self.max_aspect_ratio = base.max_aspect_ratio
+        self.sharpness_threshold = base.sharpness_threshold
+        self.nms_iou_threshold = base.nms_iou_threshold
+        self.save_debug_vis = base.save_debug_vis
+
+        self.min_area = max(1, int(base.min_area_ref * area_scale))
+        self.max_area = max(self.min_area + 1, int(base.max_area_ref * area_scale))
+
+        self.min_w = max(4, int(round(base.min_w_ref * length_scale)))
+        self.min_h = max(4, int(round(base.min_h_ref * length_scale)))
+        self.max_w = max(self.min_w + 1, int(round(base.max_w_ref * length_scale)))
+        self.max_h = max(self.min_h + 1, int(round(base.max_h_ref * length_scale)))
+
+        self.fill_kernel = ensure_odd(max(3, int(round(base.fill_kernel_ref * length_scale))))
+        self.small_kernel = ensure_odd(max(3, int(round(base.small_kernel_ref * length_scale))))
+        self.merge_kernel = ensure_odd(max(3, int(round(base.merge_kernel_ref * length_scale))))
+
+        self.length_scale = length_scale
+        self.area_scale = area_scale
+        self.frame_size = frame_size
+        self.magnification = magnification
+
+
+def ensure_odd(v: int) -> int:
+    return v if v % 2 == 1 else v + 1
+
+
+def build_scaled_dataset_params(
+    magnification: float,
+    frame_size: tuple[int, int],
+    profile: DatasetParams | None = None,
+) -> ScaledDatasetParams:
+    if profile is None:
+        profile = MAGNIFICATION_PROFILES.get(magnification, DatasetParams())
+    return ScaledDatasetParams(profile, magnification, frame_size)
+
+
+# --------------------------------------------------
+# 基础工具
+# --------------------------------------------------
 
 def compute_sharpness(roi):
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-
-def crop_box_with_pad(frame, x, y, w, h, pad):
-    frame_h, frame_w = frame.shape[:2]
-    x1 = max(x - pad, 0)
-    y1 = max(y - pad, 0)
-    x2 = min(x + w + pad, frame_w)
-    y2 = min(y + h + pad, frame_h)
-    return frame[y1:y2, x1:x2]
 
 
 def bbox_to_yolo(x, y, w, h, frame_w, frame_h):
@@ -116,7 +198,11 @@ def draw_boxes(frame, boxes, color=(0, 255, 0), thickness=2):
     return vis
 
 
-def detect(frame, fg_mask, params: DatasetParams, predictor=None):
+# --------------------------------------------------
+# 检测逻辑
+# --------------------------------------------------
+
+def detect(frame, fg_mask, params: ScaledDatasetParams):
     fill_kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (params.fill_kernel, params.fill_kernel)
     )
@@ -127,9 +213,11 @@ def detect(frame, fg_mask, params: DatasetParams, predictor=None):
         cv2.MORPH_ELLIPSE, (params.merge_kernel, params.merge_kernel)
     )
 
+    # 背景减除结果做形态学清理
     fg_filled = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, fill_kernel)
     fg_filled = cv2.morphologyEx(fg_filled, cv2.MORPH_OPEN, small_kernel)
 
+    # 灰度阈值分割
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
@@ -143,6 +231,7 @@ def detect(frame, fg_mask, params: DatasetParams, predictor=None):
     )
     gray_thresh = cv2.morphologyEx(gray_thresh, cv2.MORPH_OPEN, small_kernel)
 
+    # 交集：既有前景变化，又有亮目标特征
     combined = cv2.bitwise_and(fg_filled, gray_thresh)
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, merge_kernel)
 
@@ -165,6 +254,7 @@ def detect(frame, fg_mask, params: DatasetParams, predictor=None):
 
         if w <= 1 or h <= 1:
             continue
+
         if w < params.min_w or h < params.min_h:
             continue
         if w > params.max_w or h > params.max_h:
@@ -182,16 +272,6 @@ def detect(frame, fg_mask, params: DatasetParams, predictor=None):
         if sharpness < params.sharpness_threshold:
             continue
 
-        # 可选 CNN 二分过滤
-        if params.enable_cnn and predictor is not None:
-            roi_for_cnn = crop_box_with_pad(frame, x, y, w, h, params.cnn_roi_pad)
-            if roi_for_cnn.size == 0:
-                continue
-
-            pred_label, conf = predictor.predict(roi_for_cnn)
-            if pred_label == "junk" and conf >= params.cnn_conf_threshold:
-                continue
-
         score = float(sharpness) + 0.01 * float(area)
         boxes.append((x, y, w, h))
         scores.append(score)
@@ -200,32 +280,66 @@ def detect(frame, fg_mask, params: DatasetParams, predictor=None):
     return boxes
 
 
-def build_dataset():
+# --------------------------------------------------
+# 主流程
+# --------------------------------------------------
+
+def build_dataset(magnification=1.0):
     base_dir = Path(__file__).resolve().parent.parent.parent
 
-    video_dir = base_dir / "data" / "video"
-    dataset_dir = base_dir / "data" / "yolo_dataset"
+    video_dir = base_dir / "data" / "video1x"
+    dataset_dir = base_dir / "data" / "yolo_dataset1x"
 
     images_dir = dataset_dir / "images"
-    labels_dir = dataset_dir / "labels"
+    labels_dir = dataset_dir / "labels_raw"
     debug_dir = dataset_dir / "debug_vis"
 
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_dir.mkdir(parents=True, exist_ok=True)
 
-    params = DatasetParams()
-    predictor = ROIPredictor() if params.enable_cnn else None
+    # 先用第一条视频读出分辨率，再构建缩放参数
+    videos = sorted(video_dir.glob("*.avi"))
+    print("videos:", len(videos))
+
+    if len(videos) == 0:
+        print("[warning] no .avi videos found.")
+        return
+
+    probe_cap = cv2.VideoCapture(str(videos[0]))
+    if not probe_cap.isOpened():
+        print(f"[warning] cannot open video: {videos[0]}")
+        return
+
+    frame_w = int(probe_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_h = int(probe_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    probe_cap.release()
+
+    params = build_scaled_dataset_params(magnification, (frame_w, frame_h))
+
+    print(f"Using magnification: {magnification}x")
+    print(f"Frame size: {frame_w}x{frame_h}")
+    print(f"Length scale: {params.length_scale:.3f}")
+    print(
+        "Scaled params:",
+        {
+            "min_area": params.min_area,
+            "max_area": params.max_area,
+            "min_w": params.min_w,
+            "min_h": params.min_h,
+            "max_w": params.max_w,
+            "max_h": params.max_h,
+            "kernels": (params.fill_kernel, params.small_kernel, params.merge_kernel),
+            "sharpness_threshold": params.sharpness_threshold,
+        },
+    )
 
     if params.save_debug_vis:
         debug_dir.mkdir(parents=True, exist_ok=True)
 
+    # 先只做一个类：microbe
     classes_txt = labels_dir / "classes.txt"
     with open(classes_txt, "w", encoding="utf-8") as f:
-        f.write("microbe\njunk\n")
-
-    videos = sorted(video_dir.glob("*.avi"))
-    print("videos:", len(videos))
-    print("CNN enabled:", params.enable_cnn)
+        f.write("microbe\n")
 
     total_saved_frames = 0
     total_saved_boxes = 0
@@ -258,7 +372,7 @@ def build_dataset():
                 continue
 
             fg_mask = subtract_background(back_sub, frame)
-            frame_boxes = detect(frame, fg_mask, params, predictor=predictor)
+            frame_boxes = detect(frame, fg_mask, params)
 
             if len(frame_boxes) < params.min_boxes_to_save_frame:
                 continue
@@ -311,4 +425,10 @@ def build_dataset():
 
 
 if __name__ == "__main__":
-    build_dataset()
+    # 老相机 1.0x
+    build_dataset(magnification=1.0)
+
+    # 其他倍率例子：
+    # build_dataset(magnification=0.5)
+    # build_dataset(magnification=0.2)
+    # build_dataset(magnification=2.0)
