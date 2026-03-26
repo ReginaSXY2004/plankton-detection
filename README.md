@@ -1,1 +1,10 @@
-# plankton-detection
+# Plankton Detection
+
+浮游生物暗场成像系统中的目标检测与图像数据构建项目。
+
+## Goals
+
+- 从视频中检测浮游生物
+- 自动裁剪 ROI 图像
+- 构建浮游生物数据集
+- 后续训练检测模型
