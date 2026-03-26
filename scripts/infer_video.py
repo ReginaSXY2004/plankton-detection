@@ -5,10 +5,11 @@ from ultralytics import YOLO
 import math
 import numpy as np
 from microbe_tracker import MicrobeTracker, Detection
+import time
 
 # ===== 路径 =====
 MODEL_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\yolov8n_microbe_1x\weights\best.pt"
-VIDEO_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\data\video0.5x\Sample10.avi"
+VIDEO_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\data\video1x\Sample8.avi"
 OUT_VIDEO = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\microbe_track_custom.avi"
 OUT_CSV = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\microbe_track_custom.csv"
 
@@ -21,7 +22,11 @@ BEST_CROP_DIR = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\t
 DEVICE = 0
 
 # ===== 当前视频倍率 =====
-MAGNIFICATION = 0.5
+MAGNIFICATION = 1
+
+
+SAVE_VIDEO = False
+SAVE_CSV = False
 
 # ===== 实时确认 / 存图参数 =====
 # 只对“已经 visible 的轨迹”再加这一层工程判定
@@ -42,18 +47,18 @@ FINALIZE_MISSED_THRESH = 8
 
 def get_infer_config(magnification: float):
     config = {
-        "conf": 0.25,
-        "imgsz": 640,
-        "dedup_iou": 0.65,
-        "dedup_center": 18,
+        "conf": 0.22,
+        "imgsz": 800,
+        "dedup_iou": 0.62,
+        "dedup_center": 16,
         "tracker": dict(
-            max_missing=14,
-            min_hits_to_show=10,
-            base_distance_thresh=20.0,
+            max_missing=18,
+            min_hits_to_show=6,
+            base_distance_thresh=18.0,
             distance_scale=1.4,
             max_size_ratio=2.0,
-            conf_threshold_for_tracking=0.25,
-            no_spawn_radius=35.0,
+            conf_threshold_for_tracking=0.22,
+            no_spawn_radius=24.0,
         )
     }
 
@@ -265,7 +270,7 @@ def best_score(sharpness: float, conf: float, area: float) -> float:
     return sharpness * 1.0 + conf * 120.0 + min(area, 2500.0) * 0.01
 
 
-def draw_track(frame, tr, is_confirmed=False, counted=False):
+def draw_track(frame, tr, display_id=None, is_confirmed=False, counted=False):
     x1, y1, x2, y2 = map(int, tr.bbox)
     color = (0, 255, 0) if is_confirmed else (0, 180, 255)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
@@ -277,7 +282,11 @@ def draw_track(frame, tr, is_confirmed=False, counted=False):
         flags.append("counted")
     flag_text = f" [{'|'.join(flags)}]" if flags else ""
 
-    text = f"id:{tr.track_id} conf:{tr.conf:.2f}{flag_text}"
+    if display_id is None:
+        text = f"tmp conf:{tr.conf:.2f}{flag_text}"
+    else:
+        text = f"id:{display_id} conf:{tr.conf:.2f}{flag_text}"
+
     cv2.putText(
         frame,
         text,
@@ -323,6 +332,8 @@ def finalize_track_record(tid, rec, confirmed_writer, best_crop_dir: Path):
 
 
 def main():
+    start_time = time.time()
+    frame_count = 0
     cfg = get_infer_config(MAGNIFICATION)
 
     CONF = cfg["conf"]
@@ -463,6 +474,7 @@ def main():
                         "counted": False,
                         "saved": False,
                         "finalized": False,
+                        "display_id": None,
                     }
 
                 rec = track_records[tid]
@@ -485,13 +497,15 @@ def main():
 
                 # 实时计数：只计一次
                 if (not rec["counted"]) and tr.hits >= CONFIRM_MIN_HITS:
-                    rec["counted"] = True
                     realtime_count += 1
+                    rec["counted"] = True
+                    rec["display_id"] = realtime_count
 
                 draw_track(
                     frame,
                     tr,
-                    is_confirmed=(tr.hits >= CONFIRM_MIN_HITS),
+                    display_id=rec["display_id"],
+                    is_confirmed=rec["counted"],
                     counted=rec["counted"]
                 )
 
@@ -549,11 +563,21 @@ def main():
 
             writer.write(frame)
             frame_idx += 1
+            # ===== FPS统计 =====
+            frame_count += 1
+            if frame_count % 30 == 0:
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed
+                print(f"[FPS] {fps:.2f}")
 
         # 视频结束后，把还没 finalize 的也统一 finalize
         for tid, rec in track_records.items():
             if not rec["finalized"]:
                 finalize_track_record(tid, rec, confirmed_writer, best_crop_dir)
+
+        total_time = time.time() - start_time
+        avg_fps = frame_count / total_time
+        print(f"\n平均FPS: {avg_fps:.2f}")
 
     cap.release()
     writer.release()
