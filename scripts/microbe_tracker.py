@@ -159,6 +159,7 @@ class MicrobeTracker:
         max_speed_px: float = 60.0,
         speed_scale: float = 3.0,
         no_spawn_radius: float = 30.0,
+        reconnect_max_missing: int = 10,
         debug_print: bool = False,
     ):
         self.max_missing = max_missing
@@ -170,6 +171,7 @@ class MicrobeTracker:
         self.max_speed_px = max_speed_px
         self.speed_scale = speed_scale
         self.no_spawn_radius = no_spawn_radius
+        self.reconnect_max_missing = reconnect_max_missing
         self.debug_print = debug_print
 
         self.tracks: Dict[int, Track] = {}
@@ -180,7 +182,7 @@ class MicrobeTracker:
 
         for tid, tr in self.tracks.items():
             # 只考虑刚丢失不久的轨迹
-            if tr.missed < 1 or tr.missed > 10:
+            if tr.missed < 1 or tr.missed > self.reconnect_max_missing:
                 continue
 
             # 框变化太大就不接
@@ -189,7 +191,7 @@ class MicrobeTracker:
 
             dist = self._center_distance(tr.cx, tr.cy, det.cx, det.cy)
             reconnect_thresh = max(
-                self.base_distance_thresh * 1.5,
+                self.base_distance_thresh * 2,
                 max(tr.w, tr.h, det.w, det.h) * (self.distance_scale+0.2)
             )
 
@@ -426,6 +428,15 @@ class MicrobeTracker:
                     tr2._occluded = True
 
     def update(self, detections: List[Detection]) -> List[Track]:
+        """
+        1. 过滤低置信度 detection
+        2. 拿出当前已有 tracks
+        3. 匹配旧 track 和新 detection
+        4. 匹配上的 track 更新位置
+        5. 没匹配上的 track 标记 missed
+        6. 没匹配上的 detection 尝试新建 track
+        7. 返回稳定可见 tracks
+        """
         detections = [d for d in detections if d.conf >= self.conf_threshold_for_tracking]
 
         track_ids = list(self.tracks.keys())

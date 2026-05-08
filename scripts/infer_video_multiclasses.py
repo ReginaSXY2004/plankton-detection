@@ -11,7 +11,7 @@ import time
 
 # ===== 路径 =====
 MODEL_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\yolov8n_1x_multiclass_v1\weights\best.pt"
-VIDEO_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\data\video1x\Sample15.avi"
+VIDEO_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\data\video1x\Sample7.avi"
 OUT_VIDEO = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\multiclass_track_custom.mp4"
 
 # confirmed 逐帧 debug（可选）
@@ -62,9 +62,20 @@ BEST_MIN_H = 12
 BEST_MIN_CONF = 0.18
 BEST_MIN_SHARPNESS = 6.0
 
-# ===== 计数 / finalize =====
-CONFIRM_MIN_HITS = 6
-FINALIZE_MISSED_THRESH = 8
+# ===== 计数 / finalize：按秒控制 =====
+CONFIRM_SECONDS = 0.20
+FINALIZE_MISSED_SECONDS = 0.30
+
+# tracker 允许目标丢失多久，按倍率给不同默认值
+MAX_MISSING_SECONDS_BY_MAG = {
+    1.0: 0.60,
+    0.5: 0.70,
+    0.2: 0.50,
+    2.0: 0.35,
+}
+
+# lost track 在多少秒内允许 reconnect
+RECONNECT_SECONDS = 0.5
 
 # ===== 类别投票 =====
 # 当轨迹被确认后，用累计投票最多的类别作为该轨迹最终类别
@@ -78,7 +89,6 @@ def get_infer_config(magnification: float):
         "dedup_iou": 0.62,
         "dedup_center": 16,
         "tracker": dict(
-            max_missing=18,
             min_hits_to_show=6,
             base_distance_thresh=18.0,
             distance_scale=1.4,
@@ -99,7 +109,6 @@ def get_infer_config(magnification: float):
             "dedup_iou": 0.60,
             "dedup_center": 12,
             "tracker": dict(
-                max_missing=20,
                 min_hits_to_show=6,
                 base_distance_thresh=16.0,
                 distance_scale=1.5,
@@ -117,7 +126,6 @@ def get_infer_config(magnification: float):
             "dedup_iou": 0.55,
             "dedup_center": 8,
             "tracker": dict(
-                max_missing=14,
                 min_hits_to_show=4,
                 base_distance_thresh=8.0,
                 distance_scale=1.2,
@@ -135,7 +143,6 @@ def get_infer_config(magnification: float):
             "dedup_iou": 0.70,
             "dedup_center": 28,
             "tracker": dict(
-                max_missing=8,
                 min_hits_to_show=3,
                 base_distance_thresh=28.0,
                 distance_scale=1.5,
@@ -231,6 +238,44 @@ def box_iou_xyxy(a, b):
     union = area_a + area_b - inter + 1e-6
     return inter / union
 
+def point_in_box(cx, cy, box):
+    x1, y1, x2, y2 = box
+    return x1 <= cx <= x2 and y1 <= cy <= y2
+
+def is_duplicate_track_candidate(new_tr, old_tr) -> bool:
+    """
+    判断两个 track 是否很可能是同一个微生物。
+    用于 counted 前去重，避免重复计数。
+    """
+    new_box = new_tr.bbox
+    old_box = old_tr.bbox
+
+    iou = box_iou_xyxy(new_box, old_box)
+    center_dist = ((new_tr.cx - old_tr.cx) ** 2 + (new_tr.cy - old_tr.cy) ** 2) ** 0.5
+
+    mutual_center_inside = (
+        point_in_box(new_tr.cx, new_tr.cy, old_box)
+        and point_in_box(old_tr.cx, old_tr.cy, new_box)
+    )
+
+    dynamic_center_thresh = 0.35 * max(
+        new_tr.w, new_tr.h, old_tr.w, old_tr.h
+    )
+
+    similar_size = (
+        max(new_tr.w, old_tr.w) / max(min(new_tr.w, old_tr.w), 1e-6) < 1.8
+        and max(new_tr.h, old_tr.h) / max(min(new_tr.h, old_tr.h), 1e-6) < 1.8
+    )
+
+    return (
+        similar_size
+        and (
+            iou > 0.35
+            or mutual_center_inside
+            or center_dist < dynamic_center_thresh
+        )
+    )
+
 
 def deduplicate_detections(detections, iou_thresh=0.65, center_thresh=18):
     detections = sorted(detections, key=lambda d: d.conf, reverse=True)
@@ -292,13 +337,15 @@ def check_best_candidate(tr, crop: np.ndarray, sharpness: float):
 def best_score(sharpness: float, conf: float, area: float) -> float:
     return sharpness * 1.0 + conf * 120.0 + min(area, 2500.0) * 0.01
 
+def seconds_to_frames(seconds: float, fps: float, min_frames: int = 1) -> int:
+    return max(min_frames, int(round(seconds * fps)))
 
 def majority_class_from_votes(class_votes: Counter):
     if not class_votes:
         return None
     cls_id, votes = class_votes.most_common(1)[0]
     if votes < MIN_CLASS_VOTES_TO_LOCK:
-        return cls_id
+        return None
     return cls_id
 
 
@@ -329,7 +376,7 @@ def maybe_save_best_crop(rec, best_crop_dir: Path):
         rec["save_fail_reason"] = "not_counted"
         return False
     if rec["best_crop"] is None:
-        rec["save_fail_reason"] = rec.get("last_best_reject_reason") or"no_valid_best_crop"
+        rec["save_fail_reason"] = rec.get("last_best_update_status") or "no_valid_best_crop"
         return False
 
     show_id = rec["display_id"] if rec["display_id"] is not None else rec["track_id"]
@@ -365,7 +412,7 @@ def finalize_track_record(rec, confirmed_writer, best_crop_dir: Path):
         rec["best_h"],
         dict(rec["class_votes"]),
         rec["save_fail_reason"],
-        rec["last_best_reject_reason"],
+        rec["last_best_update_status"],
     ])
 
 
@@ -415,7 +462,6 @@ def main():
     print("=" * 60)
 
     model = YOLO(MODEL_PATH)
-    tracker = MicrobeTracker(**cfg["tracker"])
 
     out_video_path = Path(OUT_VIDEO)
     out_video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -438,6 +484,42 @@ def main():
     if src_fps <= 0:
         src_fps = 25.0
 
+    confirm_min_hits = seconds_to_frames(
+    CONFIRM_SECONDS,
+    src_fps,
+    min_frames=3
+    )
+
+    finalize_missed_thresh = seconds_to_frames(
+        FINALIZE_MISSED_SECONDS,
+        src_fps,
+        min_frames=3
+    )
+
+    max_missing_seconds = MAX_MISSING_SECONDS_BY_MAG.get(float(MAGNIFICATION), 0.60)
+    max_missing_frames = seconds_to_frames(
+        max_missing_seconds,
+        src_fps,
+        min_frames=3
+    )
+
+    reconnect_max_missing = seconds_to_frames(
+        RECONNECT_SECONDS,
+        src_fps,
+        min_frames=2
+    )
+
+    cfg["tracker"]["max_missing"] = max_missing_frames
+    cfg["tracker"]["reconnect_max_missing"] = reconnect_max_missing
+
+    print(f"src_fps: {src_fps}")
+    print(f"confirm_min_hits: {confirm_min_hits} frames ({CONFIRM_SECONDS}s)")
+    print(f"finalize_missed_thresh: {finalize_missed_thresh} frames ({FINALIZE_MISSED_SECONDS}s)")
+    print(f"max_missing_frames: {max_missing_frames} frames ({max_missing_seconds}s)")
+    print(f"reconnect_max_missing: {reconnect_max_missing} frames ({RECONNECT_SECONDS}s)")
+
+    tracker = MicrobeTracker(**cfg["tracker"])
+
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -452,6 +534,7 @@ def main():
 
     # internal track_id -> record
     track_records = {}
+    counted_tracks = {}
     realtime_count = 0
     class_counts = Counter()
 
@@ -474,7 +557,7 @@ def main():
                 "final_cls_id", "final_cls_name",
                 "first_frame", "last_frame", "best_frame",
                 "best_conf", "best_sharpness", "best_w", "best_h", "class_votes",
-                "save_fail_reason", "last_best_reject_reason"
+                "save_fail_reason", "last_best_update_status"
             ])
 
             frame_idx = 0
@@ -528,6 +611,11 @@ def main():
 
                 tracks = tracker.update(detections)
                 tracks_to_draw = []
+                # 清理已经不在 tracker 里的 counted track，避免历史旧目标影响新目标计数
+                active_track_ids = set(tracker.tracks.keys())
+                for old_tid in list(counted_tracks.keys()):
+                    if old_tid not in active_track_ids:
+                        del counted_tracks[old_tid]
 
                 for tr in tracks:
                     tid = tr.track_id
@@ -549,11 +637,13 @@ def main():
                             "counted": False,
                             "saved": False,
                             "finalized": False,
+                            "is_duplicate": False,
+                            "duplicate_of": None,
                             "class_votes": Counter(),
                             "final_cls_id": None,
                             "last_cls_id": None,
                             "save_fail_reason": "",
-                            "last_best_reject_reason": "",
+                            "last_best_update_status": "",
                         }
 
                     rec = track_records[tid]
@@ -573,7 +663,7 @@ def main():
                     ok_best, reason = check_best_candidate(tr, crop, sharpness)
 
                     if not ok_best:
-                        rec["last_best_reject_reason"] = reason
+                        rec["last_best_update_status"] = reason
                     else:
                         # 如果合格，就和历史 best 比分
                         score = best_score(sharpness, tr.conf, area)
@@ -585,17 +675,33 @@ def main():
                             rec["best_w"] = 0 if crop is None else crop.shape[1]
                             rec["best_h"] = 0 if crop is None else crop.shape[0]
                             rec["best_crop"] = None if crop is None else crop.copy() # best crop 每个 track 只保留目前最好的那一张
-                            rec["last_best_reject_reason"] = "accepted_as_best"
+                            rec["last_best_update_status"] = "accepted_as_best"
 
                     # track 达到条件之后才counted
-                    if (not rec["counted"]) and tr.hits >= CONFIRM_MIN_HITS:
-                        realtime_count += 1
-                        rec["counted"] = True
-                        rec["display_id"] = realtime_count
-                        locked_cls = rec["final_cls_id"] if rec["final_cls_id"] is not None else tr.cls_id
-                        class_counts[locked_cls] += 1
+                    if (not rec["counted"]) and (not rec["is_duplicate"]) and tr.hits >= confirm_min_hits:
+                        duplicate_of = None
 
-                    if rec["counted"]:
+                        for old_tid, old_tr in counted_tracks.items():
+                            if is_duplicate_track_candidate(tr, old_tr):
+                                duplicate_of = old_tid
+                                break
+
+                        if duplicate_of is not None:
+                            rec["is_duplicate"] = True
+                            rec["duplicate_of"] = duplicate_of
+                            rec["counted"] = False
+                            rec["display_id"] = track_records[duplicate_of]["display_id"]
+                        else:
+                            realtime_count += 1
+                            rec["counted"] = True
+                            rec["display_id"] = realtime_count
+
+                            locked_cls = rec["final_cls_id"] if rec["final_cls_id"] is not None else tr.cls_id
+                            class_counts[locked_cls] += 1
+
+                            counted_tracks[tid] = tr
+
+                    if rec["counted"] and (not rec["is_duplicate"]):
                         tracks_to_draw.append((tr, rec))
 
                         if SAVE_DEBUG_CSV and debug_writer is not None:
@@ -630,7 +736,7 @@ def main():
                     rec = track_records.get(tid)
                     if rec is None or rec["finalized"]:
                         continue
-                    if tr.missed >= FINALIZE_MISSED_THRESH and rec["counted"]:
+                    if tr.missed >= finalize_missed_thresh and rec["counted"]:
                         finalize_track_record(rec, confirmed_writer, best_crop_dir)
 
                 cv2.putText(
