@@ -2,37 +2,31 @@
 venv/
 venv312/
 
-# datasets
+# datasets / outputs
 data/
+runs/
+weights/
+
+# legacy code
+scripts_legacy/
+src_legacy/
+
+# model / media files
 *.pt
+*.onnx
 *.mp4
 *.avi
 *.csv
 *.cache
 
-
-# docs
-
-
-# runs
-runs/
-
-# scripts_legacy
-scripts_lagacy/
-
-# src_legacy
-src_legacy/
-weights/
-
-
 # python cache
 __pycache__/
 *.pyc
 
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[codz]
-*$py.class
+# system / editor
+.vscode/
+.DS_Store
+
 
 # C extensions
 *.so
