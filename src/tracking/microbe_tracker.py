@@ -176,6 +176,7 @@ class MicrobeTracker:
 
         self.tracks: Dict[int, Track] = {}
         self.next_id = 1
+        
     def _try_reconnect_lost_track(self, det: Detection):
         best_tid = None
         best_cost = 1e9

@@ -1,374 +1,52 @@
+"""
+微生物检测与跟踪主入口
+
+本文件负责：
+1. 视频读取
+2. YOLO 推理
+3. detection 后处理
+4. tracker 更新
+5. 实时计数
+6. best crop 管理
+7. 视频与 CSV 输出
+"""
+
 from pathlib import Path
 import csv
 import cv2
-from ultralytics import YOLO
-import math
-import numpy as np
-from collections import Counter
-from microbe_tracker import MicrobeTracker, Detection
 import time
-
-
-# ===== 路径 =====
-MODEL_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\yolov8n_1x_multiclass_v1\weights\best.pt"
-VIDEO_PATH = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\data\video1x\Sample7.avi"
-OUT_VIDEO = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\multiclass_track_custom.mp4"
-
-# confirmed 逐帧 debug（可选）
-OUT_DEBUG_CSV = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\confirmed_tracks_debug_multiclass.csv"
-
-# confirmed 汇总
-OUT_CONFIRMED_CSV = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\confirmed_microbes_multiclass.csv"
-
-# 每个 confirmed ID 的最佳图
-BEST_CROP_DIR = r"C:\Users\Regina Sun\Documents\GitHub\plankton-detection\runs\track_analysis\best_crops_multiclass"
-
-DEVICE = 0
-
-# ===== 当前视频倍率 =====
-MAGNIFICATION = 1
-
-# ===== 类别名 =====
-CLASS_NAMES = {
-    0: "daxingzao",
-    1: "jianshuizao",
-    2: "xiannvchong",
-    3: "lunchong",
-    4: "xiangbizao",
-    5: "weizhi",
-    6: "xianchong",
-}
-
-# 可选：给类别一个固定颜色，便于看视频
-CLASS_COLORS = {
-    0: (255, 80, 80),     # daxingzao
-    1: (80, 255, 255),    # jianshuizao
-    2: (80, 255, 80),     # xiannvchong
-    3: (80, 80, 255),     # lunchong
-    4: (180, 80, 255),    # xiangbizao
-    5: (255, 80, 200),    # weizhi
-    6: (255, 180, 80),    # xianchong
-}
-
-# ===== 输出开关 =====
-SAVE_VIDEO = True
-SAVE_DEBUG_CSV = False
-PRINT_FPS = True
-SHOW_CLASS_COUNTS_ON_VIDEO = True
-
-# ===== 最佳图参数 =====
-BEST_MIN_W = 12
-BEST_MIN_H = 12
-BEST_MIN_CONF = 0.18
-BEST_MIN_SHARPNESS = 6.0
-
-# ===== 计数 / finalize：按秒控制 =====
-CONFIRM_SECONDS = 0.20
-FINALIZE_MISSED_SECONDS = 0.30
-
-# tracker 允许目标丢失多久，按倍率给不同默认值
-MAX_MISSING_SECONDS_BY_MAG = {
-    1.0: 0.60,
-    0.5: 0.70,
-    0.2: 0.50,
-    2.0: 0.35,
-}
-
-# lost track 在多少秒内允许 reconnect
-RECONNECT_SECONDS = 0.5
-
-# ===== 类别投票 =====
-# 当轨迹被确认后，用累计投票最多的类别作为该轨迹最终类别
-MIN_CLASS_VOTES_TO_LOCK = 3
-
-
-def get_infer_config(magnification: float):
-    config = {
-        "conf": 0.35,
-        "imgsz": 800,
-        "dedup_iou": 0.62,
-        "dedup_center": 16,
-        "tracker": dict(
-            min_hits_to_show=6,
-            base_distance_thresh=18.0,
-            distance_scale=1.4,
-            max_size_ratio=2.0,
-            conf_threshold_for_tracking=0.22,
-            no_spawn_radius=24.0,
-            debug_print=False,
-        )
-    }
-
-    if magnification == 1.0:
-        return config
-
-    elif magnification == 0.5:
-        return {
-            "conf": 0.35,
-            "imgsz": 800,
-            "dedup_iou": 0.60,
-            "dedup_center": 12,
-            "tracker": dict(
-                min_hits_to_show=6,
-                base_distance_thresh=16.0,
-                distance_scale=1.5,
-                max_size_ratio=2.0,
-                conf_threshold_for_tracking=0.18,
-                no_spawn_radius=20.0,
-                debug_print=False,
-            )
-        }
-
-    elif magnification == 0.2:
-        return {
-            "conf": 0.40,
-            "imgsz": 1280,
-            "dedup_iou": 0.55,
-            "dedup_center": 8,
-            "tracker": dict(
-                min_hits_to_show=4,
-                base_distance_thresh=8.0,
-                distance_scale=1.2,
-                max_size_ratio=2.0,
-                conf_threshold_for_tracking=0.12,
-                no_spawn_radius=16.0,
-                debug_print=False,
-            )
-        }
-
-    elif magnification == 2.0:
-        return {
-            "conf": 0.40,
-            "imgsz": 640,
-            "dedup_iou": 0.70,
-            "dedup_center": 28,
-            "tracker": dict(
-                min_hits_to_show=3,
-                base_distance_thresh=28.0,
-                distance_scale=1.5,
-                max_size_ratio=2.2,
-                conf_threshold_for_tracking=0.28,
-                no_spawn_radius=50.0,
-                debug_print=False,
-            )
-        }
-
-    print(f"[warning] 未定义倍率 {magnification}x，自动按 1.0x 参数运行。")
-    return config
-
-
-def compute_circularity_from_roi(frame, det):
-    x1, y1, x2, y2 = map(int, [det.x1, det.y1, det.x2, det.y2])
-
-    h, w = frame.shape[:2]
-    x1 = max(0, min(x1, w - 1))
-    y1 = max(0, min(y1, h - 1))
-    x2 = max(0, min(x2, w))
-    y2 = max(0, min(y2, h))
-
-    if x2 <= x1 or y2 <= y1:
-        return None, None
-
-    roi = frame[y1:y2, x1:x2]
-    if roi.size == 0:
-        return None, None
-
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None, float(np.std(gray))
-
-    cnt = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(cnt)
-    perimeter = cv2.arcLength(cnt, True)
-
-    if perimeter <= 1e-6:
-        return None, float(np.std(gray))
-
-    circularity = 4.0 * math.pi * area / (perimeter * perimeter)
-    texture_std = float(np.std(gray))
-    return circularity, texture_std
-
-
-def filter_blob_like_detections(frame, detections,
-                                circularity_thresh=0.82,
-                                texture_std_thresh=18.0,
-                                min_box_size=10):
-    kept = []
-    for det in detections:
-        bw = det.x2 - det.x1
-        bh = det.y2 - det.y1
-
-        if bw < min_box_size or bh < min_box_size:
-            kept.append(det)
-            continue
-
-        circularity, texture_std = compute_circularity_from_roi(frame, det)
-        if circularity is None:
-            kept.append(det)
-            continue
-
-        if circularity > circularity_thresh and texture_std < texture_std_thresh:
-            continue
-
-        kept.append(det)
-
-    return kept
-
-
-def box_iou_xyxy(a, b):
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = area_a + area_b - inter + 1e-6
-    return inter / union
-
-def point_in_box(cx, cy, box):
-    x1, y1, x2, y2 = box
-    return x1 <= cx <= x2 and y1 <= cy <= y2
-
-def is_duplicate_track_candidate(new_tr, old_tr) -> bool:
-    """
-    判断两个 track 是否很可能是同一个微生物。
-    用于 counted 前去重，避免重复计数。
-    """
-    new_box = new_tr.bbox
-    old_box = old_tr.bbox
-
-    iou = box_iou_xyxy(new_box, old_box)
-    center_dist = ((new_tr.cx - old_tr.cx) ** 2 + (new_tr.cy - old_tr.cy) ** 2) ** 0.5
-
-    mutual_center_inside = (
-        point_in_box(new_tr.cx, new_tr.cy, old_box)
-        and point_in_box(old_tr.cx, old_tr.cy, new_box)
-    )
-
-    dynamic_center_thresh = 0.35 * max(
-        new_tr.w, new_tr.h, old_tr.w, old_tr.h
-    )
-
-    similar_size = (
-        max(new_tr.w, old_tr.w) / max(min(new_tr.w, old_tr.w), 1e-6) < 1.8
-        and max(new_tr.h, old_tr.h) / max(min(new_tr.h, old_tr.h), 1e-6) < 1.8
-    )
-
-    return (
-        similar_size
-        and (
-            iou > 0.35
-            or mutual_center_inside
-            or center_dist < dynamic_center_thresh
-        )
-    )
-
-
-def deduplicate_detections(detections, iou_thresh=0.65, center_thresh=18):
-    detections = sorted(detections, key=lambda d: d.conf, reverse=True)
-    kept = []
-
-    for det in detections:
-        keep = True
-        for k in kept:
-            iou = box_iou_xyxy((det.x1, det.y1, det.x2, det.y2), (k.x1, k.y1, k.x2, k.y2))
-            center_dist = ((det.cx - k.cx) ** 2 + (det.cy - k.cy) ** 2) ** 0.5
-
-            if iou > iou_thresh or center_dist < center_thresh:
-                keep = False
-                break
-
-        if keep:
-            kept.append(det)
-
-    return kept
-
-
-def compute_sharpness(roi_bgr: np.ndarray) -> float:
-    if roi_bgr is None or roi_bgr.size == 0:
-        return 0.0
-    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-
-def safe_crop(frame: np.ndarray, bbox):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, min(int(round(x1)), w - 1))
-    y1 = max(0, min(int(round(y1)), h - 1))
-    x2 = max(0, min(int(round(x2)), w))
-    y2 = max(0, min(int(round(y2)), h))
-    if x2 <= x1 or y2 <= y1:
-        return None, (x1, y1, x2, y2)
-    return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
-
-# 这一帧的这个目标，有没有资格参加“最佳截图评选”
-def check_best_candidate(tr, crop: np.ndarray, sharpness: float):
-    if crop is None or crop.size == 0:
-        return False, "empty_crop"
-
-    h, w = crop.shape[:2]
-
-    if w < BEST_MIN_W or h < BEST_MIN_H:
-        return False, "too_small"
-
-    if tr.conf < BEST_MIN_CONF:
-        return False, "low_conf"
-
-    if sharpness < BEST_MIN_SHARPNESS:
-        return False, "low_sharpness"
-
-    return True, "ok"
-
-
-def best_score(sharpness: float, conf: float, area: float) -> float:
-    return sharpness * 1.0 + conf * 120.0 + min(area, 2500.0) * 0.01
-
-def seconds_to_frames(seconds: float, fps: float, min_frames: int = 1) -> int:
-    return max(min_frames, int(round(seconds * fps)))
-
-def majority_class_from_votes(class_votes: Counter):
-    if not class_votes:
-        return None
-    cls_id, votes = class_votes.most_common(1)[0]
-    if votes < MIN_CLASS_VOTES_TO_LOCK:
-        return None
-    return cls_id
-
-
-def draw_confirmed_track(frame, tr, rec):
-    x1, y1, x2, y2 = map(int, tr.bbox)
-    cls_id = rec["final_cls_id"] if rec["final_cls_id"] is not None else rec["last_cls_id"]
-    cls_name = CLASS_NAMES.get(cls_id, f"cls{cls_id}") if cls_id is not None else "unknown"
-    color = CLASS_COLORS.get(cls_id, (0, 255, 0))
-
-    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-    text = f"id:{rec['display_id']} {cls_name} {tr.conf:.2f}"
-    cv2.putText(
-        frame,
-        text,
-        (x1, max(18, y1 - 6)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        color,
-        1,
-        cv2.LINE_AA
-    )
-
+import shutil
+
+from collections import Counter
+
+from ultralytics import YOLO
+
+from src.config.infer_config import *
+
+from src.tracking.microbe_tracker import (
+    MicrobeTracker,
+    Detection,
+)
+
+from src.inference.postprocess import (
+    deduplicate_detections,
+    filter_blob_like_detections,
+    is_duplicate_track_candidate,
+)
+
+from src.inference.crop_utils import (
+    compute_sharpness,
+    safe_crop,
+    check_best_candidate,
+    best_score,
+    seconds_to_frames,
+    majority_class_from_votes,
+)
+
+from src.output.visualization import (
+    draw_confirmed_track,
+    draw_class_count_panel,
+)
 
 def maybe_save_best_crop(rec, best_crop_dir: Path):
     rec["save_fail_reason"] = ""
@@ -416,31 +94,6 @@ def finalize_track_record(rec, confirmed_writer, best_crop_dir: Path):
     ])
 
 
-def draw_class_count_panel(frame, class_counts, total_count):
-    x0, y0 = 10, 80
-    line_h = 24
-
-    cv2.putText(
-        frame, f"total:{total_count}", (x0, y0),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2, cv2.LINE_AA
-    )
-
-    sorted_items = sorted(class_counts.items(), key=lambda kv: kv[0])
-    for i, (cls_id, cnt) in enumerate(sorted_items, start=1):
-        cls_name = CLASS_NAMES.get(cls_id, f"cls{cls_id}")
-        color = CLASS_COLORS.get(cls_id, (255, 255, 255))
-        cv2.putText(
-            frame,
-            f"{cls_name}:{cnt}",
-            (x0, y0 + i * line_h),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            cv2.LINE_AA
-        )
-
-
 def main():
     start_time = time.time()
     frame_count = 0
@@ -462,6 +115,13 @@ def main():
     print("=" * 60)
 
     model = YOLO(MODEL_PATH)
+
+    track_analysis_dir = Path(TRACK_ANALYSIS_DIR)
+
+    if track_analysis_dir.exists():
+        shutil.rmtree(track_analysis_dir)
+
+    track_analysis_dir.mkdir(parents=True, exist_ok=True)
 
     out_video_path = Path(OUT_VIDEO)
     out_video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -524,11 +184,11 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     writer = None
-    if SAVE_VIDEO:
+    if SAVE_VIDEO_EVERY_N_FRAMES > 0:
         writer = cv2.VideoWriter(
             str(out_video_path),
             cv2.VideoWriter_fourcc(*"mp4v"),
-            src_fps,
+            src_fps / SAVE_VIDEO_EVERY_N_FRAMES,
             (width, height)
         )
 
@@ -753,7 +413,10 @@ def main():
                 if SHOW_CLASS_COUNTS_ON_VIDEO:
                     draw_class_count_panel(frame, class_counts, realtime_count)
 
-                if writer is not None:
+                if (
+                    writer is not None
+                    and frame_idx % SAVE_VIDEO_EVERY_N_FRAMES == 0
+                ):
                     writer.write(frame)
 
                 frame_idx += 1
@@ -779,7 +442,7 @@ def main():
         if f_debug is not None:
             f_debug.close()
 
-    if SAVE_VIDEO:
+    if SAVE_VIDEO_EVERY_N_FRAMES > 0:
         print(f"完成视频：{OUT_VIDEO}")
     else:
         print("完成视频：未保存（SAVE_VIDEO=False）")

@@ -1,18 +1,29 @@
 # environments
 venv/
-plankton_env/
+venv312/
 
 # datasets
-data/picture_best/
-data/debug_best/
-data/picture_best2/
-data/debug_best2/
-data/train/
-data/val/
-data/video/
+data/
+*.pt
+*.mp4
+*.avi
+*.csv
+*.cache
 
 
-data/yolo_dataset/
+# docs
+
+
+# runs
+runs/
+
+# scripts_legacy
+scripts_lagacy/
+
+# src_legacy
+src_legacy/
+weights/
+
 
 # python cache
 __pycache__/
