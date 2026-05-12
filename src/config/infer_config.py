@@ -145,6 +145,14 @@ VIDEO_WRITER_BACKEND = "ffmpeg_nvenc"
 
 VIDEO_BITRATE = "8M"
 
+# =========================================================
+# Long-Running Session / Video Segmentation
+# =========================================================
+
+# 长时间部署时，单个 mp4 文件过大且异常退出风险更高。
+# 因此系统按固定时长切分视频 segment。
+VIDEO_SEGMENT_MINUTES = 30
+
 
 # =========================================================
 # Best Crop Thresholds

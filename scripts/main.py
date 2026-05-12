@@ -17,6 +17,8 @@ import cv2
 import time
 import shutil
 
+from datetime import datetime, timedelta
+
 from collections import Counter
 
 from src.config.infer_config import *
@@ -47,33 +49,69 @@ from src.output.visualization import (
     draw_class_count_panel,
 )
 
-def maybe_save_best_crop(rec, best_crop_dir: Path):
+def maybe_save_best_crop(rec, best_crop_dir: Path, src_fps: float):
     rec["save_fail_reason"] = ""
+
     if not rec["counted"]:
         rec["save_fail_reason"] = "not_counted"
         return False
+
     if rec["best_crop"] is None:
         rec["save_fail_reason"] = rec.get("last_best_update_status") or "no_valid_best_crop"
         return False
 
     show_id = rec["display_id"] if rec["display_id"] is not None else rec["track_id"]
     cls_name = CLASS_NAMES.get(rec["final_cls_id"], "unknown")
+
+    best_timestamp_sec = rec["best_frame"] / max(src_fps, 1e-6)
+    best_segment_id = rec.get("best_segment_id", -1)
+
     out_path = best_crop_dir / (
-        f"{cls_name}_showid_{show_id:03d}_track_{rec['track_id']:03d}_frame_{rec['best_frame']:05d}.png"
+        f"{cls_name}"
+        f"_seg_{best_segment_id:03d}"
+        f"_t_{best_timestamp_sec:.1f}s"
+        f"_showid_{show_id:03d}"
+        f"_track_{rec['track_id']:03d}"
+        f"_frame_{rec['best_frame']:05d}.png"
     )
+
     ok = cv2.imwrite(str(out_path), rec["best_crop"])
+    rec["best_crop_path"] = str(out_path) if ok else ""
     rec["save_fail_reason"] = "saved" if ok else "imwrite_failed"
     return ok
 
 
-def finalize_track_record(rec, confirmed_writer, best_crop_dir: Path):
+def finalize_track_record(
+    rec,
+    confirmed_writer,
+    best_crop_dir: Path,
+    session_name: str,
+    src_fps: float,
+):
     if rec["finalized"]:
         return
 
     rec["finalized"] = True
-    rec["saved"] = maybe_save_best_crop(rec, best_crop_dir)
+    rec["saved"] = maybe_save_best_crop(rec, best_crop_dir, src_fps)
+
+    first_timestamp_sec = rec["first_frame"] / max(src_fps, 1e-6)
+    last_timestamp_sec = rec["last_frame"] / max(src_fps, 1e-6)
+    best_timestamp_sec = rec["best_frame"] / max(src_fps, 1e-6) if rec["best_frame"] >= 0 else -1
 
     confirmed_writer.writerow([
+        session_name,
+        rec.get("first_segment_id", -1),
+        rec.get("last_segment_id", -1),
+        rec.get("best_segment_id", -1),
+        
+        rec.get("first_video_filename", ""),
+        rec.get("last_video_filename", ""),
+        rec.get("best_video_filename", ""),
+
+        round(first_timestamp_sec, 3),
+        round(last_timestamp_sec, 3),
+        round(best_timestamp_sec, 3),
+
         rec["display_id"],
         rec["track_id"],
         rec["counted"],
@@ -88,10 +126,10 @@ def finalize_track_record(rec, confirmed_writer, best_crop_dir: Path):
         rec["best_w"],
         rec["best_h"],
         dict(rec["class_votes"]),
+        rec.get("best_crop_path", ""),
         rec["save_fail_reason"],
         rec["last_best_update_status"],
     ])
-
 
 def main():
     start_time = time.time()
@@ -117,25 +155,35 @@ def main():
 
     detector = YoloDetector(MODEL_PATH, device=DEVICE)
 
-    track_analysis_dir = Path(TRACK_ANALYSIS_DIR)
+    # 一个 session 对应一次连续运行任务。
+    # 对真实部署来说，对应一次机器人下水/一次连续检测。
+    session_start_dt = datetime.now()
+    session_name = session_start_dt.strftime("%Y-%m-%d_T%H-%M-%S")
 
+    track_analysis_dir = (
+        PROJECT_ROOT
+        / "runs"
+        / "track_analysis"
+        / f"{VIDEO_STEM}_{session_name}"
+    )
+
+    # 当前仍是实验脚本逻辑：每次运行清空同名 session 目录。
+    # 由于 session_name 带时间戳，正常不会误删历史结果。
     if track_analysis_dir.exists():
         shutil.rmtree(track_analysis_dir)
 
-    track_analysis_dir.mkdir(parents=True, exist_ok=True)
+    video_dir = track_analysis_dir / "videos"
+    csv_dir = track_analysis_dir / "csv"
+    best_crop_dir = track_analysis_dir / "best_crops"
+    log_dir = track_analysis_dir / "logs"
 
-    out_video_path = Path(OUT_VIDEO)
-    out_video_path.parent.mkdir(parents=True, exist_ok=True)
-
-    confirmed_csv_path = Path(OUT_CONFIRMED_CSV)
-    confirmed_csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    best_crop_dir = Path(BEST_CROP_DIR)
+    video_dir.mkdir(parents=True, exist_ok=True)
+    csv_dir.mkdir(parents=True, exist_ok=True)
     best_crop_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    debug_csv_path = Path(OUT_DEBUG_CSV)
-    if SAVE_DEBUG_CSV:
-        debug_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    confirmed_csv_path = csv_dir / "confirmed_microbes.csv"
+    debug_csv_path = csv_dir / "confirmed_tracks_debug.csv"
 
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
@@ -185,18 +233,31 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     writer = None
+    segment_id = 0
+    segment_frames = None
+    current_video_path = None
 
     if SAVE_VIDEO_EVERY_N_FRAMES > 0:
         output_fps = src_fps / SAVE_VIDEO_EVERY_N_FRAMES
 
+        # segment_frames 表示多少“原始输入帧”后切一个新视频。
+        # 注意：这里按原始 frame_idx 切分，而不是按实际写入帧数切分。
+        segment_frames = int(src_fps * VIDEO_SEGMENT_MINUTES * 60)
+
+        segment_start_dt = session_start_dt
+        segment_time_str = segment_start_dt.strftime("%H-%M-%S")
+        current_video_path = video_dir / f"video_{segment_id:03d}_{segment_time_str}.mp4"
+
         writer = VideoWriterWrapper(
-            out_video_path=out_video_path,
+            out_video_path=current_video_path,
             width=width,
             height=height,
             fps=output_fps,
             backend=VIDEO_WRITER_BACKEND,
             bitrate=VIDEO_BITRATE,
         )
+
+        print(f"当前视频 segment：{current_video_path}")
 
     # internal track_id -> record
     track_records = {}
@@ -219,11 +280,35 @@ def main():
         with open(confirmed_csv_path, "w", newline="", encoding="utf-8") as f_confirmed:
             confirmed_writer = csv.writer(f_confirmed)
             confirmed_writer.writerow([
-                "display_id", "track_id", "counted", "saved",
-                "final_cls_id", "final_cls_name",
-                "first_frame", "last_frame", "best_frame",
-                "best_conf", "best_sharpness", "best_w", "best_h", "class_votes",
-                "save_fail_reason", "last_best_update_status"
+                "session_name",
+                "first_segment_id",
+                "last_segment_id",
+                "best_segment_id",
+                "first_video_filename",
+                "last_video_filename",
+                "best_video_filename",
+
+                "first_timestamp_sec",
+                "last_timestamp_sec",
+                "best_timestamp_sec",
+
+                "display_id",
+                "track_id",
+                "counted",
+                "saved",
+                "final_cls_id",
+                "final_cls_name",
+                "first_frame",
+                "last_frame",
+                "best_frame",
+                "best_conf",
+                "best_sharpness",
+                "best_w",
+                "best_h",
+                "class_votes",
+                "best_crop_path",
+                "save_fail_reason",
+                "last_best_update_status",
             ])
 
             frame_idx = 0
@@ -312,10 +397,22 @@ def main():
                             "last_cls_id": None,
                             "save_fail_reason": "",
                             "last_best_update_status": "",
+                            "first_segment_id": segment_id,
+                            "last_segment_id": segment_id,
+                            "best_segment_id": -1,
+                            "first_video_filename": "" if current_video_path is None else current_video_path.name,
+                            "last_video_filename": "" if current_video_path is None else current_video_path.name,
+                            "best_video_filename": "",
+                            "best_crop_path": "",
                         }
 
                     rec = track_records[tid]
                     rec["last_frame"] = frame_idx
+                    rec["last_segment_id"] = segment_id
+                    rec["last_video_filename"] = (
+                        "" if current_video_path is None
+                        else current_video_path.name
+                    )
                     rec["last_cls_id"] = tr.cls_id
                     rec["class_votes"][tr.cls_id] += 1
 
@@ -343,6 +440,11 @@ def main():
                             rec["best_w"] = 0 if crop is None else crop.shape[1]
                             rec["best_h"] = 0 if crop is None else crop.shape[0]
                             rec["best_crop"] = None if crop is None else crop.copy() # best crop 每个 track 只保留目前最好的那一张
+                            rec["best_segment_id"] = segment_id
+                            rec["best_video_filename"] = (
+                                "" if current_video_path is None
+                                else current_video_path.name
+                            )
                             rec["last_best_update_status"] = "accepted_as_best"
 
                     # track 达到条件之后才counted
@@ -410,7 +512,13 @@ def main():
                         continue
 
                     if tr.missed >= finalize_missed_thresh and rec["counted"]:
-                        finalize_track_record(rec, confirmed_writer, best_crop_dir)
+                        finalize_track_record(
+                            rec,
+                            confirmed_writer,
+                            best_crop_dir,
+                            session_name,
+                            src_fps,
+                        )
                         # 释放最占内存的图片，但保留 record 防止重复计数
                         rec["best_crop"] = None
 
@@ -431,6 +539,27 @@ def main():
 
                 t4 = time.time()
 
+                # 长时间运行时，按固定时长切分视频 segment。
+                # 短视频不足 VIDEO_SEGMENT_MINUTES 时不会触发切分，仍然正常保存为 video_000_xxx.mp4。
+                if (
+                    writer is not None
+                    and segment_frames is not None
+                    and frame_idx > 0
+                    and frame_idx % segment_frames == 0
+                ):
+                    segment_id += 1
+
+                    segment_start_dt = session_start_dt + timedelta(
+                        seconds=frame_idx / max(src_fps, 1e-6)
+                    )
+                    segment_time_str = segment_start_dt.strftime("%H-%M-%S")
+                    current_video_path = video_dir / f"video_{segment_id:03d}_{segment_time_str}.mp4"
+
+                    print(f"[Video Segment] 切换到新视频：{current_video_path}")
+                    writer.reopen(current_video_path)
+
+                # 视频写入在所有可视化绘制完成后执行，
+                # 因此输出视频包含 bbox、track id、frame id 和实时计数面板。
                 if (
                     writer is not None
                     and frame_idx % SAVE_VIDEO_EVERY_N_FRAMES == 0
@@ -472,7 +601,13 @@ def main():
 
             for tid, rec in list(track_records.items()):
                 if rec["counted"] and (not rec["finalized"]):
-                    finalize_track_record(rec, confirmed_writer, best_crop_dir)
+                    finalize_track_record(
+                        rec,
+                        confirmed_writer,
+                        best_crop_dir,
+                        session_name,
+                        src_fps,
+                    )
 
                 if rec["finalized"]:
                     track_records.pop(tid, None)
@@ -491,17 +626,17 @@ def main():
             f_debug.close()
 
     if SAVE_VIDEO_EVERY_N_FRAMES > 0:
-        print(f"完成视频：{OUT_VIDEO}")
+        print(f"完成视频目录：{video_dir}")
     else:
-        print("完成视频：未保存（SAVE_VIDEO=False）")
+        print("完成视频：未保存（SAVE_VIDEO_EVERY_N_FRAMES=0）")
 
     if SAVE_DEBUG_CSV:
-        print(f"confirmed 逐帧 debug CSV：{OUT_DEBUG_CSV}")
+        print(f"confirmed 逐帧 debug CSV：{debug_csv_path}")
     else:
         print("confirmed 逐帧 debug CSV：未保存（SAVE_DEBUG_CSV=False）")
 
-    print(f"confirmed 汇总 CSV：{OUT_CONFIRMED_CSV}")
-    print(f"最佳图目录：{BEST_CROP_DIR}")
+    print(f"confirmed 汇总 CSV：{confirmed_csv_path}")
+    print(f"最佳图目录：{best_crop_dir}")
     print(f"实时总计数：{realtime_count}")
 
     print("分类别计数：")
