@@ -30,14 +30,14 @@ MODEL_PATH = (
     / "runs"
     / "yolov8n_1x_multiclass_v1"
     / "weights"
-    / "best.pt"
+    / "best.engine"
 )
 
 VIDEO_PATH = (
     PROJECT_ROOT
     / "data"
     / "video1x"
-    / "Sample17.avi"
+    / "Sample16.avi"
 )
 
 VIDEO_STEM = VIDEO_PATH.stem

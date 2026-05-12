@@ -7,6 +7,9 @@ data/
 runs/
 weights/
 
+# other scripts
+scripts/export_tensorrt_engine.py
+
 # legacy code
 scripts_legacy/
 src_legacy/
