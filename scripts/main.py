@@ -19,14 +19,13 @@ import shutil
 
 from collections import Counter
 
-from ultralytics import YOLO
-
 from src.config.infer_config import *
 
-from src.tracking.microbe_tracker import (
-    MicrobeTracker,
-    Detection,
-)
+from src.inference.detector import YoloDetector
+
+from src.output.video_writer import VideoWriterWrapper
+
+from src.tracking.microbe_tracker import MicrobeTracker
 
 from src.inference.postprocess import (
     deduplicate_detections,
@@ -116,7 +115,7 @@ def main():
     print(f"MODEL_PATH: {MODEL_PATH}")
     print("=" * 60)
 
-    model = YOLO(MODEL_PATH)
+    detector = YoloDetector(MODEL_PATH, device=DEVICE)
 
     track_analysis_dir = Path(TRACK_ANALYSIS_DIR)
 
@@ -186,12 +185,17 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     writer = None
+
     if SAVE_VIDEO_EVERY_N_FRAMES > 0:
-        writer = cv2.VideoWriter(
-            str(out_video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            src_fps / SAVE_VIDEO_EVERY_N_FRAMES,
-            (width, height)
+        output_fps = src_fps / SAVE_VIDEO_EVERY_N_FRAMES
+
+        writer = VideoWriterWrapper(
+            out_video_path=out_video_path,
+            width=width,
+            height=height,
+            fps=output_fps,
+            backend=VIDEO_WRITER_BACKEND,
+            bitrate=VIDEO_BITRATE,
         )
 
     # internal track_id -> record
@@ -229,35 +233,15 @@ def main():
                 if not ret:
                     break
                 
-                # Yolo 检测
-                result = model.predict(
-                    source=frame,
+                # YOLO 检测：返回统一的 Detection list
+                detections = detector.detect(
+                    frame,
                     conf=CONF,
-                    imgsz=IMGSZ,
-                    device=DEVICE,
-                    verbose=False
-                )[0]
-
+                    imgsz=IMGSZ
+                )
+                
                 t1 = time.time()
 
-                detections = []
-                if result.boxes is not None and len(result.boxes) > 0:
-                    xyxy = result.boxes.xyxy.cpu().numpy()
-                    confs = result.boxes.conf.cpu().numpy()
-                    clses = result.boxes.cls.cpu().numpy().astype(int)
-
-                    for i, box in enumerate(xyxy):
-                        x1, y1, x2, y2 = map(float, box)
-                        detections.append(
-                            Detection(
-                                x1=x1,
-                                y1=y1,
-                                x2=x2,
-                                y2=y2,
-                                conf=float(confs[i]),
-                                cls_id=int(clses[i])
-                            )
-                        )
                 raw_det_count = len(detections)
 
                 # 去重，过滤圆形亮斑
@@ -502,6 +486,7 @@ def main():
         cap.release()
         if writer is not None:
             writer.release()
+
         if f_debug is not None:
             f_debug.close()
 

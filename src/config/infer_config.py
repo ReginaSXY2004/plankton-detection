@@ -37,7 +37,7 @@ VIDEO_PATH = (
     PROJECT_ROOT
     / "data"
     / "video1x"
-    / "Sample16.avi"
+    / "Sample17.avi"
 )
 
 VIDEO_STEM = VIDEO_PATH.stem
@@ -130,6 +130,20 @@ SAVE_DEBUG_CSV = False
 PRINT_FPS = True
 
 SHOW_CLASS_COUNTS_ON_VIDEO = True
+
+
+# =========================================================
+# Video Writer Backend
+# =========================================================
+
+# opencv_mp4v
+# ffmpeg_nvenc
+# jetson_gstreamer
+# none
+
+VIDEO_WRITER_BACKEND = "ffmpeg_nvenc"
+
+VIDEO_BITRATE = "8M"
 
 
 # =========================================================
