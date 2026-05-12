@@ -29,9 +29,6 @@ from src.config.infer_config import (
 def compute_sharpness(roi_bgr: np.ndarray) -> float:
     """
     计算 crop 的清晰度。
-
-    使用 Laplacian 方差作为清晰度指标：
-    数值越大，边缘变化越明显，通常表示图像越清晰。
     """
 
     if roi_bgr is None or roi_bgr.size == 0:
@@ -46,7 +43,7 @@ def safe_crop(frame: np.ndarray, bbox):
     """
     根据 bbox 从原始帧中安全裁剪 crop。
 
-    会自动处理：
+    自动处理：
     1. bbox 超出图像边界
     2. bbox 坐标不是整数
     3. bbox 无效导致裁剪区域为空
@@ -143,8 +140,6 @@ def seconds_to_frames(
 def majority_class_from_votes(class_votes):
     """
     根据轨迹历史类别投票，确定该 track 的最终类别。
-
-    如果票数不足，则暂时不锁定类别。
     """
 
     if not class_votes:

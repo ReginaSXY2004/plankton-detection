@@ -97,6 +97,8 @@ def finalize_track_record(rec, confirmed_writer, best_crop_dir: Path):
 def main():
     start_time = time.time()
     frame_count = 0
+    last_print_time = start_time
+    last_print_frame = 0
     cfg = get_infer_config(MAGNIFICATION)
 
     CONF = cfg["conf"]
@@ -222,6 +224,7 @@ def main():
 
             frame_idx = 0
             while True:
+                t0 = time.time()
                 ret, frame = cap.read()
                 if not ret:
                     break
@@ -234,6 +237,8 @@ def main():
                     device=DEVICE,
                     verbose=False
                 )[0]
+
+                t1 = time.time()
 
                 detections = []
                 if result.boxes is not None and len(result.boxes) > 0:
@@ -253,6 +258,7 @@ def main():
                                 cls_id=int(clses[i])
                             )
                         )
+                raw_det_count = len(detections)
 
                 # 去重，过滤圆形亮斑
                 detections = deduplicate_detections(
@@ -269,13 +275,31 @@ def main():
                     min_box_size=10
                 )
 
+                t2 = time.time()
+
+                kept_det_count = len(detections)
+
                 tracks = tracker.update(detections)
+
+                t3 = time.time()
+
                 tracks_to_draw = []
                 # 清理已经不在 tracker 里的 counted track，避免历史旧目标影响新目标计数
                 active_track_ids = set(tracker.tracks.keys())
+
+                # 清理已经不在 tracker 里的 counted_tracks
                 for old_tid in list(counted_tracks.keys()):
                     if old_tid not in active_track_ids:
-                        del counted_tracks[old_tid]
+                        counted_tracks.pop(old_tid, None)
+
+                # 只清理已经不在 tracker 里、且已经 finalized 的 track_records
+                for old_tid in list(track_records.keys()):
+                    rec = track_records.get(old_tid)
+                    if rec is None:
+                        continue
+
+                    if old_tid not in active_track_ids and rec["finalized"]:
+                        track_records.pop(old_tid, None)
 
                 for tr in tracks:
                     tid = tr.track_id
@@ -392,12 +416,20 @@ def main():
                 for tr, rec in tracks_to_draw:
                     draw_confirmed_track(frame, tr, rec)
 
+
                 for tid, tr in list(tracker.tracks.items()):
                     rec = track_records.get(tid)
-                    if rec is None or rec["finalized"]:
+                    if rec is None:
                         continue
+
+                    if rec["finalized"]:
+                        continue
+
                     if tr.missed >= finalize_missed_thresh and rec["counted"]:
                         finalize_track_record(rec, confirmed_writer, best_crop_dir)
+                        # 释放最占内存的图片，但保留 record 防止重复计数
+                        rec["best_crop"] = None
+
 
                 cv2.putText(
                     frame,
@@ -413,23 +445,54 @@ def main():
                 if SHOW_CLASS_COUNTS_ON_VIDEO:
                     draw_class_count_panel(frame, class_counts, realtime_count)
 
+                t4 = time.time()
+
                 if (
                     writer is not None
                     and frame_idx % SAVE_VIDEO_EVERY_N_FRAMES == 0
                 ):
                     writer.write(frame)
 
+                t5 = time.time()
+
                 frame_idx += 1
                 frame_count += 1
 
-                if PRINT_FPS and frame_count % 30 == 0:
-                    elapsed = time.time() - start_time
-                    fps_now = frame_count / max(elapsed, 1e-6)
-                    print(f"[FPS] {fps_now:.2f}")
+                if PRINT_FPS and frame_count % 120 == 0:
+                    now = time.time()
 
-            for rec in track_records.values():
+                    total_elapsed = now - start_time
+                    avg_fps = frame_count / max(total_elapsed, 1e-6)
+
+                    window_elapsed = now - last_print_time
+                    window_frames = frame_count - last_print_frame
+                    window_fps = window_frames / max(window_elapsed, 1e-6)
+
+                    print(
+                        f"[FPS] window={window_fps:.2f} avg={avg_fps:.2f} | "
+                        f"raw_det={raw_det_count} kept_det={kept_det_count} | "
+                        f"active_tracks={len(tracker.tracks)} "
+                        f"visible_tracks={len(tracks_to_draw)} "
+                        f"track_records={len(track_records)}"
+                    )
+                    print(
+                        f"[TIME] "
+                        f"yolo={(t1-t0)*1000:.1f}ms "
+                        f"post={(t2-t1)*1000:.1f}ms "
+                        f"track={(t3-t2)*1000:.1f}ms "
+                        f"draw={(t4-t3)*1000:.1f}ms "
+                        f"write={(t5-t4)*1000:.1f}ms"
+                    )
+                    last_print_time = now
+                    last_print_frame = frame_count
+
+            for tid, rec in list(track_records.items()):
                 if rec["counted"] and (not rec["finalized"]):
                     finalize_track_record(rec, confirmed_writer, best_crop_dir)
+
+                if rec["finalized"]:
+                    track_records.pop(tid, None)
+                    counted_tracks.pop(tid, None)
 
             total_time = time.time() - start_time
             avg_fps = frame_count / max(total_time, 1e-6)
@@ -459,6 +522,16 @@ def main():
     print("分类别计数：")
     for cls_id in sorted(class_counts.keys()):
         print(f"  {CLASS_NAMES.get(cls_id, cls_id)}: {class_counts[cls_id]}")
+
+    print("\n===== Runtime Monitor Description =====")
+    print("window          : 最近窗口 FPS（瞬时速度）")
+    print("avg             : 从开始到现在的平均 FPS")
+    print("raw_det         : YOLO 原始 detection 数量")
+    print("kept_det        : 后处理后保留的 detection 数量")
+    print("active_tracks   : 当前 tracker 中的轨迹总数")
+    print("visible_tracks  : 当前已 confirmed 并显示的轨迹数")
+    print("track_records   : 当前内存中的历史 track record 数量")
+    print("=======================================")
 
 
 if __name__ == "__main__":

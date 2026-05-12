@@ -37,7 +37,7 @@ VIDEO_PATH = (
     PROJECT_ROOT
     / "data"
     / "video1x"
-    / "Sample17.avi"
+    / "Sample16.avi"
 )
 
 VIDEO_STEM = VIDEO_PATH.stem
@@ -221,7 +221,7 @@ def get_infer_config(magnification: float):
     elif magnification == 0.2:
         return {
             "conf": 0.40,
-            "imgsz": 1280,
+            "imgsz": 800,
             "dedup_iou": 0.55,
             "dedup_center": 8,
 
