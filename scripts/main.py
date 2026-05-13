@@ -27,6 +27,8 @@ from src.inference.detector import YoloDetector
 
 from src.output.video_writer import VideoWriterWrapper
 
+from src.output.async_video_writer import AsyncVideoWriter
+
 from src.tracking.microbe_tracker import MicrobeTracker
 
 from src.inference.postprocess import (
@@ -131,6 +133,79 @@ def finalize_track_record(
         rec["last_best_update_status"],
     ])
 
+
+def cleanup_track_records(
+    track_records,
+    counted_tracks,
+    active_track_ids,
+    current_frame_idx,
+    stale_unconfirmed_frames,
+    stale_duplicate_frames,
+    stale_counted_frames,
+):
+    """
+    长时间运行清理函数：
+    1. finalized 且不 active 的 record
+    2. 未 counted 且不 active 很久的 record
+    3. duplicate 且不 active 的 record
+    4. counted_tracks 中不 active 很久的旧 track
+    """
+
+    removed_records = 0
+    removed_counted = 0
+    released_best_crops = 0
+
+    for tid in list(track_records.keys()):
+        rec = track_records.get(tid)
+        if rec is None:
+            continue
+
+        is_active = tid in active_track_ids
+        inactive_frames = current_frame_idx - rec.get("last_frame", current_frame_idx)
+
+        should_remove = False
+
+        if (not is_active) and rec.get("finalized", False):
+            should_remove = True
+
+        elif (not is_active) and (not rec.get("counted", False)) and inactive_frames >= stale_unconfirmed_frames:
+            should_remove = True
+
+        elif (not is_active) and rec.get("is_duplicate", False) and inactive_frames >= stale_duplicate_frames:
+            should_remove = True
+
+        if should_remove:
+            if rec.get("best_crop") is not None:
+                rec["best_crop"] = None
+                released_best_crops += 1
+
+            track_records.pop(tid, None)
+            counted_tracks.pop(tid, None)
+            removed_records += 1
+
+    for tid in list(counted_tracks.keys()):
+        if tid in active_track_ids:
+            continue
+
+        rec = track_records.get(tid)
+        if rec is None:
+            counted_tracks.pop(tid, None)
+            removed_counted += 1
+            continue
+
+        inactive_frames = current_frame_idx - rec.get("last_frame", current_frame_idx)
+
+        if inactive_frames >= stale_counted_frames:
+            counted_tracks.pop(tid, None)
+            removed_counted += 1
+
+    return {
+        "removed_records": removed_records,
+        "removed_counted": removed_counted,
+        "released_best_crops": released_best_crops,
+    }
+
+
 def main():
     start_time = time.time()
     frame_count = 0
@@ -218,6 +293,24 @@ def main():
         min_frames=2
     )
 
+    stale_unconfirmed_frames = seconds_to_frames(
+        2.0,
+        src_fps,
+        min_frames=max_missing_frames + 1
+    )
+
+    stale_duplicate_frames = seconds_to_frames(
+        1.0,
+        src_fps,
+        min_frames=max_missing_frames + 1
+    )
+
+    stale_counted_frames = seconds_to_frames(
+        2.0,
+        src_fps,
+        min_frames=max_missing_frames + 1
+    )
+
     cfg["tracker"]["max_missing"] = max_missing_frames
     cfg["tracker"]["reconnect_max_missing"] = reconnect_max_missing
 
@@ -226,6 +319,10 @@ def main():
     print(f"finalize_missed_thresh: {finalize_missed_thresh} frames ({FINALIZE_MISSED_SECONDS}s)")
     print(f"max_missing_frames: {max_missing_frames} frames ({max_missing_seconds}s)")
     print(f"reconnect_max_missing: {reconnect_max_missing} frames ({RECONNECT_SECONDS}s)")
+    print(f"stale_unconfirmed_frames: {stale_unconfirmed_frames}")
+    print(f"stale_duplicate_frames: {stale_duplicate_frames}")
+    print(f"stale_counted_frames: {stale_counted_frames}")
+
 
     tracker = MicrobeTracker(**cfg["tracker"])
 
@@ -248,13 +345,18 @@ def main():
         segment_time_str = segment_start_dt.strftime("%H-%M-%S")
         current_video_path = video_dir / f"video_{segment_id:03d}_{segment_time_str}.mp4"
 
-        writer = VideoWriterWrapper(
+        base_writer = VideoWriterWrapper(
             out_video_path=current_video_path,
             width=width,
             height=height,
             fps=output_fps,
             backend=VIDEO_WRITER_BACKEND,
             bitrate=VIDEO_BITRATE,
+        )
+
+        writer = AsyncVideoWriter(
+            base_writer,
+            max_queue_size=16,
         )
 
         print(f"当前视频 segment：{current_video_path}")
@@ -353,22 +455,19 @@ def main():
                 t3 = time.time()
 
                 tracks_to_draw = []
-                # 清理已经不在 tracker 里的 counted track，避免历史旧目标影响新目标计数
+
+
                 active_track_ids = set(tracker.tracks.keys())
 
-                # 清理已经不在 tracker 里的 counted_tracks
-                for old_tid in list(counted_tracks.keys()):
-                    if old_tid not in active_track_ids:
-                        counted_tracks.pop(old_tid, None)
-
-                # 只清理已经不在 tracker 里、且已经 finalized 的 track_records
-                for old_tid in list(track_records.keys()):
-                    rec = track_records.get(old_tid)
-                    if rec is None:
-                        continue
-
-                    if old_tid not in active_track_ids and rec["finalized"]:
-                        track_records.pop(old_tid, None)
+                cleanup_stats = cleanup_track_records(
+                    track_records=track_records,
+                    counted_tracks=counted_tracks,
+                    active_track_ids=active_track_ids,
+                    current_frame_idx=frame_idx,
+                    stale_unconfirmed_frames=stale_unconfirmed_frames,
+                    stale_duplicate_frames=stale_duplicate_frames,
+                    stale_counted_frames=stale_counted_frames,
+                )
 
                 for tr in tracks:
                     tid = tr.track_id
@@ -580,14 +679,30 @@ def main():
                     window_elapsed = now - last_print_time
                     window_frames = frame_count - last_print_frame
                     window_fps = window_frames / max(window_elapsed, 1e-6)
+                    writer_stats = (
+                        writer.stats()
+                        if writer is not None and hasattr(writer, "stats")
+                        else {
+                            "qsize": 0,
+                            "dropped_frames": 0,
+                            "written_frames": 0,
+                        }
+                    )
 
                     print(
                         f"[FPS] window={window_fps:.2f} avg={avg_fps:.2f} | "
                         f"raw_det={raw_det_count} kept_det={kept_det_count} | "
                         f"active_tracks={len(tracker.tracks)} "
                         f"visible_tracks={len(tracks_to_draw)} "
-                        f"track_records={len(track_records)}"
+                        f"track_records={len(track_records)} | "
+                        f"writer_q={writer_stats['qsize']} "
+                        f"writer_drop={writer_stats['dropped_frames']} "
+                        f"writer_written={writer_stats['written_frames']} | "
+                        f"cleanup_rec={cleanup_stats['removed_records']} "
+                        f"cleanup_counted={cleanup_stats['removed_counted']} "
+                        f"released_crop={cleanup_stats['released_best_crops']} "
                     )
+
                     print(
                         f"[TIME] "
                         f"yolo={(t1-t0)*1000:.1f}ms "
@@ -651,6 +766,9 @@ def main():
     print("active_tracks   : 当前 tracker 中的轨迹总数")
     print("visible_tracks  : 当前已 confirmed 并显示的轨迹数")
     print("track_records   : 当前内存中的历史 track record 数量")
+    print("writer_q        : 当前 writer queue 中等待写入的帧数")
+    print("writer_drop     : 因 queue 满而被丢弃的 debug 视频帧数")
+    print("writer_written  : 后台线程已成功写入的视频帧数")
     print("=======================================")
 
 
