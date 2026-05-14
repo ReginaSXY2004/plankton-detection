@@ -1,6 +1,13 @@
 # environments
 venv/
-venv312/
+venv_jetson/
+venv_broken/
+
+*.whl
+
+__pycache__/
+*.pyc
+
 
 # datasets / outputs
 data/

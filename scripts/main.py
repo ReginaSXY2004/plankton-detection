@@ -260,7 +260,7 @@ def main():
     confirmed_csv_path = csv_dir / "confirmed_microbes.csv"
     debug_csv_path = csv_dir / "confirmed_tracks_debug.csv"
 
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    cap = cv2.VideoCapture(str(VIDEO_PATH))
     if not cap.isOpened():
         raise RuntimeError(f"打不开视频: {VIDEO_PATH}")
 

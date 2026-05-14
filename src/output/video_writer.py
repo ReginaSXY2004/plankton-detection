@@ -32,6 +32,24 @@ class VideoWriterWrapper:
 
         self.open(out_video_path)
 
+
+    def _bitrate_to_int(self):
+        """
+        将 '8M' / '4000k' / 8000000 转成 GStreamer 需要的整数 bps。
+        """
+        if isinstance(self.bitrate, int):
+            return self.bitrate
+
+        s = str(self.bitrate).strip().lower()
+
+        if s.endswith("m"):
+            return int(float(s[:-1]) * 1_000_000)
+
+        if s.endswith("k"):
+            return int(float(s[:-1]) * 1_000)
+
+        return int(float(s))
+
     def open(self, out_video_path):
         self.out_video_path = out_video_path
         self.writer = None
@@ -71,10 +89,59 @@ class VideoWriterWrapper:
                 str(out_video_path),
             ]
 
+
+
+        elif self.backend == "jetson_gstreamer":
+            bitrate = self._bitrate_to_int()
+
+            gst_cmd = [
+                "gst-launch-1.0",
+                "-e",
+
+                "fdsrc",
+                "fd=0",
+
+                "!",
+                "rawvideoparse",
+                f"width={self.width}",
+                f"height={self.height}",
+                f"framerate={int(round(self.fps))}/1",
+                "format=bgr",
+
+                "!",
+                "videoconvert",
+
+                "!",
+                "video/x-raw,format=I420",
+
+                "!",
+                "nvvidconv",
+
+                "!",
+                "video/x-raw(memory:NVMM),format=NV12",
+
+                "!",
+                "nvv4l2h264enc",
+                f"bitrate={bitrate}",
+                "insert-sps-pps=true",
+                "maxperf-enable=true",
+                "preset-level=1",
+                "iframeinterval=30",
+
+                "!",
+                "h264parse",
+
+                "!",
+                "qtmux",
+
+                "!",
+                "filesink",
+                f"location={str(out_video_path)}",
+            ]
             self.writer = subprocess.Popen(
-                ffmpeg_cmd,
+                gst_cmd,
                 stdin=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
+                stderr=None,
             )
 
         else:
@@ -102,6 +169,9 @@ class VideoWriterWrapper:
         elif self.backend == "ffmpeg_nvenc":
             self.writer.stdin.write(frame.tobytes())
 
+        elif self.backend == "jetson_gstreamer":
+            self.writer.stdin.write(frame.tobytes())
+
     def release(self):
         if self.writer is None:
             return
@@ -109,7 +179,7 @@ class VideoWriterWrapper:
         if self.backend == "opencv_mp4v":
             self.writer.release()
 
-        elif self.backend == "ffmpeg_nvenc":
+        elif self.backend in {"ffmpeg_nvenc", "jetson_gstreamer"}:
             self.writer.stdin.close()
             self.writer.wait()
 

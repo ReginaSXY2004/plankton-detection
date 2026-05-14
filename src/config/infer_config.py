@@ -30,14 +30,14 @@ MODEL_PATH = (
     / "runs"
     / "yolov8n_1x_multiclass_v1"
     / "weights"
-    / "best.engine"
+    / "best_jetson_fp16.engine"
 )
 
 VIDEO_PATH = (
     PROJECT_ROOT
     / "data"
     / "video1x"
-    / "Sample16.avi"
+    / "sample16.avi"
 )
 
 VIDEO_STEM = VIDEO_PATH.stem
@@ -123,7 +123,7 @@ CLASS_COLORS = {
 # 2 = save every 2 frames
 # 3 = save every 3 frames
 
-SAVE_VIDEO_EVERY_N_FRAMES = 1
+SAVE_VIDEO_EVERY_N_FRAMES = 2
 
 SAVE_DEBUG_CSV = False
 
@@ -141,9 +141,9 @@ SHOW_CLASS_COUNTS_ON_VIDEO = True
 # jetson_gstreamer
 # none
 
-VIDEO_WRITER_BACKEND = "ffmpeg_nvenc"
+VIDEO_WRITER_BACKEND = "jetson_gstreamer"
 
-VIDEO_BITRATE = "8M"
+VIDEO_BITRATE = "4M"
 
 # =========================================================
 # Long-Running Session / Video Segmentation
