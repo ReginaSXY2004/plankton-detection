@@ -9,6 +9,14 @@ weights/
 
 # other scripts
 scripts/export_tensorrt_engine.py
+scripts/main_stress_playlist.py
+visualize_labels.py
+
+# docs
+docs/当前系统架构与部署状态.md
+docs/微生物追踪算法流程.md
+docs/真实水体环境风险分析.md
+docs/运行速度与部署风险分析.md
 
 # legacy code
 scripts_legacy/
