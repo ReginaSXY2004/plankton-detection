@@ -141,7 +141,7 @@ SHOW_CLASS_COUNTS_ON_VIDEO = True
 # jetson_gstreamer
 # none
 
-VIDEO_WRITER_BACKEND = "jetson_gstreamer"
+VIDEO_WRITER_BACKEND = "jetson_gstreamer_bgrx"
 
 VIDEO_BITRATE = "4M"
 

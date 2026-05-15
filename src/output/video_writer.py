@@ -144,6 +144,56 @@ class VideoWriterWrapper:
                 stderr=None,
             )
 
+
+
+        elif self.backend == "jetson_gstreamer_bgrx":
+            bitrate = self._bitrate_to_int()
+
+            gst_cmd = [
+                "gst-launch-1.0",
+                "-e",
+
+                "fdsrc",
+                "fd=0",
+
+                "!",
+                "rawvideoparse",
+                f"width={self.width}",
+                f"height={self.height}",
+                f"framerate={int(round(self.fps))}/1",
+                "format=bgrx",
+
+                "!",
+                "nvvidconv",
+
+                "!",
+                "video/x-raw(memory:NVMM),format=NV12",
+
+                "!",
+                "nvv4l2h264enc",
+                f"bitrate={bitrate}",
+                "insert-sps-pps=true",
+                "maxperf-enable=true",
+                "preset-level=1",
+                "iframeinterval=30",
+
+                "!",
+                "h264parse",
+
+                "!",
+                "qtmux",
+
+                "!",
+                "filesink",
+                f"location={str(out_video_path)}",
+            ]
+
+            self.writer = subprocess.Popen(
+                gst_cmd,
+                stdin=subprocess.PIPE,
+                stderr=None,
+            )
+
         else:
             raise ValueError(f"Unknown video writer backend: {self.backend}")
 
@@ -171,6 +221,10 @@ class VideoWriterWrapper:
 
         elif self.backend == "jetson_gstreamer":
             self.writer.stdin.write(frame.tobytes())
+
+        elif self.backend == "jetson_gstreamer_bgrx":
+            frame_bgrx = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            self.writer.stdin.write(memoryview(frame_bgrx))
 
     def release(self):
         if self.writer is None:

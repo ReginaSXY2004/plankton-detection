@@ -18,7 +18,7 @@ class AsyncVideoWriter:
     def __init__(
         self,
         writer,
-        max_queue_size=16,
+        max_queue_size= 64,
     ):
         self.writer = writer
 
@@ -63,7 +63,7 @@ class AsyncVideoWriter:
             return
 
         try:
-            self.queue.put_nowait(frame.copy())
+            self.queue.put_nowait(frame)
 
         except queue.Full:
             self.dropped_frames += 1
