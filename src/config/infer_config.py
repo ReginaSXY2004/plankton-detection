@@ -123,7 +123,7 @@ CLASS_COLORS = {
 # 2 = save every 2 frames
 # 3 = save every 3 frames
 
-SAVE_VIDEO_EVERY_N_FRAMES = 2
+SAVE_VIDEO_EVERY_N_FRAMES = 1
 
 SAVE_DEBUG_CSV = False
 

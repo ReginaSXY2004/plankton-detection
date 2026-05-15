@@ -164,6 +164,11 @@ class VideoWriterWrapper:
                 "format=bgrx",
 
                 "!",
+                "queue",
+                "max-size-buffers=4",
+                "leaky=downstream",
+
+                "!",
                 "nvvidconv",
 
                 "!",
@@ -172,10 +177,11 @@ class VideoWriterWrapper:
                 "!",
                 "nvv4l2h264enc",
                 f"bitrate={bitrate}",
+                "control-rate=1",
                 "insert-sps-pps=true",
                 "maxperf-enable=true",
                 "preset-level=1",
-                "iframeinterval=30",
+                "iframeinterval=60",
 
                 "!",
                 "h264parse",
