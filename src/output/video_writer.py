@@ -194,6 +194,60 @@ class VideoWriterWrapper:
                 f"location={str(out_video_path)}",
             ]
 
+        elif self.backend == "jetson_gstreamer_bgr_queue":
+            bitrate = self._bitrate_to_int()
+
+            gst_cmd = [
+                "gst-launch-1.0",
+                "-e",
+
+                "fdsrc",
+                "fd=0",
+
+                "!",
+                "rawvideoparse",
+                f"width={self.width}",
+                f"height={self.height}",
+                f"framerate={int(round(self.fps))}/1",
+                "format=bgr",
+
+                "!",
+                "queue",
+                "max-size-buffers=4",
+                "leaky=downstream",
+
+                "!",
+                "videoconvert",
+
+                "!",
+                "video/x-raw,format=I420",
+
+                "!",
+                "nvvidconv",
+
+                "!",
+                "video/x-raw(memory:NVMM),format=NV12",
+
+                "!",
+                "nvv4l2h264enc",
+                f"bitrate={bitrate}",
+                "control-rate=1",
+                "insert-sps-pps=true",
+                "maxperf-enable=true",
+                "preset-level=1",
+                "iframeinterval=60",
+
+                "!",
+                "h264parse",
+
+                "!",
+                "qtmux",
+
+                "!",
+                "filesink",
+                f"location={str(out_video_path)}",
+            ]
+
             self.writer = subprocess.Popen(
                 gst_cmd,
                 stdin=subprocess.PIPE,
@@ -232,6 +286,9 @@ class VideoWriterWrapper:
             frame_bgrx = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
             self.writer.stdin.write(memoryview(frame_bgrx))
 
+        elif self.backend == "jetson_gstreamer_bgr_queue":
+            self.writer.stdin.write(memoryview(frame))
+
     def release(self):
         if self.writer is None:
             return
@@ -239,7 +296,12 @@ class VideoWriterWrapper:
         if self.backend == "opencv_mp4v":
             self.writer.release()
 
-        elif self.backend in {"ffmpeg_nvenc", "jetson_gstreamer"}:
+        elif self.backend in {
+            "ffmpeg_nvenc",
+            "jetson_gstreamer",
+            "jetson_gstreamer_bgrx",
+            "jetson_gstreamer_bgr_queue",
+        }:
             self.writer.stdin.close()
             self.writer.wait()
 

@@ -356,7 +356,7 @@ def main():
 
         writer = AsyncVideoWriter(
             base_writer,
-            max_queue_size=16,
+            max_queue_size=64,
         )
 
         print(f"当前视频 segment：{current_video_path}")
