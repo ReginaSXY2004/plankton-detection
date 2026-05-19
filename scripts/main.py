@@ -9,6 +9,12 @@
 5. 实时计数
 6. best crop 管理
 7. 视频与 CSV 输出
+8. 长时间运行 cleanup
+9. 视频 segment 切分
+
+运行方式：
+source venv_jetson/bin/activate
+PYTHONPATH=.:/usr/lib/python3.10/dist-packages python scripts/main.py
 """
 
 from pathlib import Path

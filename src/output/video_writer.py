@@ -8,8 +8,14 @@ class VideoWriterWrapper:
 
     支持：
     1. opencv_mp4v：兼容性高，但通常走 CPU 编码
-    2. ffmpeg_nvenc：Windows/NVIDIA 上使用 FFmpeg + NVENC 硬件编码
-    3. none：不保存视频
+    2. ffmpeg_nvenc：Windows/NVIDIA PC 上使用 FFmpeg + NVENC
+    3. jetson_gstreamer：Jetson GStreamer 基础硬件编码 pipeline
+    4. jetson_gstreamer_bgrx：Jetson BGRx pipeline，历史优化版本
+    5. jetson_gstreamer_bgr_queue：当前 Jetson 推荐 pipeline
+       - 输入 OpenCV BGR frame
+       - 由 GStreamer 内部完成颜色转换
+       - 使用 nvv4l2h264enc 硬件编码
+    6. none：不保存视频
 
     这个类也支持 reopen()，用于长时间运行时切分视频 segment。
     """

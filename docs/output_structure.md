@@ -44,9 +44,12 @@ Sample17_2026-05-13_T11-23-54/
 说明：
 
 - `videos/`：保存带检测框、track id、计数面板的输出视频
-- `csv/`：保存 confirmed track 汇总 CSV 和可选 debug CSV
+- `csv/`：保存 confirmed track 汇总 CSV 和可选 debug CSV（目前为关闭状态）
 - `best_crops/`：保存每个 confirmed microbe 的最佳截图
 - `logs/`：预留日志目录
+
+当前项目的大部分调试、统计与长期运行状态，
+均通过这些输出目录进行分析。
 
 ---
 
@@ -177,7 +180,7 @@ SAVE_DEBUG_CSV = True
 - 类别是否频繁变化
 - missed / hits 是否异常
 
-默认部署时通常可以关闭，避免 CSV 文件过大。
+默认部署时通常可以关闭，避免 CSV 文件过大，运行缓慢。
 
 ---
 
@@ -205,11 +208,18 @@ best_crops/
 | `track_023` | tracker 内部 ID |
 | `frame_00321` | best crop 所在帧 |
 
+文件名设计原因：
+任何输出文件都应该能反向定位到：
+视频时间
+track
+segment
+frame
+
 ---
 
 ## 8. best crop 选择逻辑
 
-系统不会保存每一帧的 crop，而是每个 track 只保留当前最优的一张。
+系统只对每个 track 只保留当前最优的一张。（不是每个真实track都能成功保存best crop，比如sharpness不够会导致放弃保存）
 
 当前评分综合考虑：
 
@@ -225,6 +235,8 @@ bbox area
 - 减少内存占用
 - 保存更清晰、更有代表性的截图
 - 方便后续人工检查
+
+*best crop 评分策略可根据后续真实部署数据继续调整。
 
 ---
 

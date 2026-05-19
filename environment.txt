@@ -1,0 +1,40 @@
+# Verified Environment
+
+Device:
+NVIDIA Jetson AGX Orin 64GB
+
+JetPack:
+6.x
+
+Python:
+3.10
+
+PyTorch:
+2.3.0
+
+Ultralytics:
+8.4.50
+
+OpenCV:
+4.13.0
+
+CUDA:
+JetPack bundled CUDA
+
+TensorRT:
+JetPack bundled TensorRT
+
+GStreamer:
+Jetson system GStreamer
+
+# Notes
+
+TensorRT engine files are platform-dependent.
+
+Recommended workflow:
+
+Windows:
+train/export best.pt
+
+Jetson:
+export TensorRT engine locally

@@ -37,7 +37,7 @@ VIDEO_PATH = (
     PROJECT_ROOT
     / "data"
     / "video1x"
-    / "sample16.avi"
+    / "sample17.avi"
 )
 
 VIDEO_STEM = VIDEO_PATH.stem
@@ -139,6 +139,9 @@ SHOW_CLASS_COUNTS_ON_VIDEO = True
 # opencv_mp4v
 # ffmpeg_nvenc
 # jetson_gstreamer
+# jetson_gstreamer_bgr_queue:
+#   当前 Jetson 推荐 backend。
+#   直接输入 OpenCV BGR frame，由 GStreamer 内部转换并使用 nvv4l2h264enc 编码。
 # none
 
 VIDEO_WRITER_BACKEND = "jetson_gstreamer_bgr_queue"
